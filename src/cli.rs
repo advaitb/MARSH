@@ -1,5 +1,6 @@
 //! Command-line interface (clap derive) and structured JSON output.
 
+use crate::bootstrap::{self, BootstrapConfig, IntervalMethod};
 use crate::estimate::point_estimate;
 use crate::io::{align_sink, align_sources, CountTable, OnMissing};
 use crate::lp::GoodLpSolver;
@@ -54,6 +55,18 @@ pub struct EstimateArgs {
     /// How to handle table taxa that are not tree leaves.
     #[arg(long, value_enum, default_value_t = OnMissingArg::Error)]
     pub on_missing: OnMissingArg,
+    /// Number of bootstrap replicates B for uncertainty; 0 disables it.
+    #[arg(long, default_value_t = 500)]
+    pub bootstrap: usize,
+    /// Bootstrap interval method.
+    #[arg(long, value_enum, default_value_t = IntervalArg::Percentile)]
+    pub interval: IntervalArg,
+    /// RNG seed for the bootstrap (reproducibility; recorded in output).
+    #[arg(long, default_value_t = 0)]
+    pub seed: u64,
+    /// Worker threads for the parallel bootstrap; 0 = all logical cores.
+    #[arg(long, default_value_t = 0)]
+    pub threads: usize,
     /// Output JSON path (default: stdout).
     #[arg(long)]
     pub out: Option<PathBuf>,
@@ -93,12 +106,48 @@ impl From<OnMissingArg> for OnMissing {
     }
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum IntervalArg {
+    Percentile,
+    MOutOfN,
+    Bca,
+}
+
+impl From<IntervalArg> for IntervalMethod {
+    fn from(a: IntervalArg) -> Self {
+        match a {
+            IntervalArg::Percentile => IntervalMethod::Percentile,
+            IntervalArg::MOutOfN => IntervalMethod::MOutOfN,
+            IntervalArg::Bca => IntervalMethod::Bca,
+        }
+    }
+}
+
 // ---- Output schema ----
 
 #[derive(Serialize)]
 struct SourceOut {
     name: String,
     proportion: f64,
+    /// Mean of the bootstrap distribution (equals `proportion` when bootstrap is disabled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ci_low: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ci_high: Option<f64>,
+    /// True when the interval is one-sided `[0, ci_high]` (near-boundary under-coverage).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    one_sided: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct BootstrapMeta {
+    replicates: usize,
+    replicates_used: usize,
+    interval: String,
+    seed: u64,
+    threads: usize,
 }
 
 #[derive(Serialize)]
@@ -116,6 +165,11 @@ struct Metadata {
     unobserved_leaves: Vec<String>,
     /// User-facing warnings (e.g. drift-robustness disabled under a star tree).
     warnings: Vec<String>,
+    /// Bootstrap run info (absent when bootstrap disabled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrap: Option<BootstrapMeta>,
+    /// Wall-clock seconds for the full estimate (point + bootstrap).
+    wall_clock_secs: f64,
 }
 
 #[derive(Serialize)]
@@ -228,9 +282,41 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
 
     let mode: UnknownMode = args.unknown.into();
 
+    // Configure the rayon thread pool if the user requested a specific count.
+    if args.threads != 0 {
+        // Best-effort: ignore error if a global pool is already set (e.g. in tests).
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build_global();
+    }
+
+    let start = std::time::Instant::now();
+
     // Point estimate
-    let (est, _prep) = point_estimate(&GoodLpSolver, &tree, &sources, &sink, mode, args.lambda)
+    let (est, prepared) = point_estimate(&GoodLpSolver, &tree, &sources, &sink, mode, args.lambda)
         .context("solving the tree-Wasserstein LP")?;
+
+    // Point weights in prepared.source_names order (named sources + optional Unknown).
+    let point_weights: Vec<f64> = est.sources.iter().map(|s| s.proportion).collect();
+
+    // Bootstrap uncertainty (mandatory source + sink resampling inside).
+    let boot_cfg = BootstrapConfig {
+        replicates: args.bootstrap,
+        seed: args.seed,
+        interval: args.interval.into(),
+        alpha: 0.05,
+    };
+    let boot = bootstrap::run(
+        &GoodLpSolver,
+        &prepared,
+        &sources,
+        &sink,
+        &point_weights,
+        &boot_cfg,
+    );
+    // name -> interval, for enriching the per-source output
+    let interval_by_name: std::collections::HashMap<&str, &bootstrap::SourceInterval> =
+        boot.sources.iter().map(|si| (si.name.as_str(), si)).collect();
 
     // Split named sources from the Unknown source for reporting.
     let unknown_fraction: f64 = est
@@ -241,13 +327,21 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         .sum::<f64>()
         + est.deficit; // v2 deficit also counts as unknown
 
+    let have_bootstrap = args.bootstrap > 0;
     let sources_out: Vec<SourceOut> = est
         .sources
         .iter()
         .filter(|s| s.name != crate::unknown::UNKNOWN_LABEL)
-        .map(|s| SourceOut {
-            name: s.name.clone(),
-            proportion: s.proportion,
+        .map(|s| {
+            let iv = interval_by_name.get(s.name.as_str());
+            SourceOut {
+                name: s.name.clone(),
+                proportion: s.proportion,
+                mean: iv.filter(|_| have_bootstrap).map(|i| i.mean),
+                ci_low: iv.filter(|_| have_bootstrap).map(|i| i.ci_low),
+                ci_high: iv.filter(|_| have_bootstrap).map(|i| i.ci_high),
+                one_sided: iv.filter(|_| have_bootstrap).map(|i| i.one_sided),
+            }
         })
         .collect();
 
@@ -286,6 +380,18 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
             dropped_taxa: dropped,
             unobserved_leaves: unobserved,
             warnings,
+            bootstrap: if have_bootstrap {
+                Some(BootstrapMeta {
+                    replicates: args.bootstrap,
+                    replicates_used: boot.replicates_used,
+                    interval: format!("{:?}", boot_cfg.interval),
+                    seed: boot.seed,
+                    threads: rayon::current_num_threads(),
+                })
+            } else {
+                None
+            },
+            wall_clock_secs: start.elapsed().as_secs_f64(),
         },
     };
 

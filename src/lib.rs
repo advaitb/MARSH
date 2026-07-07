@@ -10,6 +10,7 @@
 //! 3. Compute per-edge cumulative masses and solve the LAD LP ([`estimate`], [`lp`]).
 //! 4. (M2) Wrap in a multinomial bootstrap for uncertainty.
 
+pub mod bootstrap;
 pub mod cli;
 pub mod estimate;
 pub mod io;
@@ -18,6 +19,7 @@ pub mod profile;
 pub mod tree;
 pub mod unknown;
 
+pub use bootstrap::{BootstrapConfig, BootstrapResult, IntervalMethod, SourceInterval};
 pub use estimate::{point_estimate, PointEstimate, Prepared, SourceEstimate};
 pub use lp::{GoodLpSolver, LadProblem, LadSolution, LpError, LpSolver, WeightConstraint};
 pub use profile::{Profile, SourceSet};
