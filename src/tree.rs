@@ -148,15 +148,138 @@ impl Tree {
             });
         }
 
-        // validate edge lengths
+        Tree::finalize(nodes, root)
+    }
+
+    /// Build a **star tree**: every taxon hangs directly off the root with unit edge length.
+    ///
+    /// This is the explicit "no phylogeny" fallback. Under a star tree, each leaf edge's
+    /// cumulative mass is just that leaf's own mass, so the tree-Wasserstein objective reduces
+    /// to `Σ_j |p_j − q_j|` — plain L1 deconvolution. **Drift-robustness is lost** (there is no
+    /// notion of "close relative"), so callers must surface this to the user. Useful when no
+    /// tree is available or taxon IDs are non-informative (they need only be unique strings).
+    pub fn build_star(taxa: &[String]) -> Result<Tree, TreeError> {
+        if taxa.is_empty() {
+            return Err(TreeError::NoLeaves);
+        }
+        let mut nodes = Vec::with_capacity(taxa.len() + 1);
+        // root
+        nodes.push(Node {
+            name: None,
+            edge_length: 0.0,
+            parent: None,
+            children: Vec::new(),
+        });
+        let root = 0;
+        for name in taxa {
+            let id = nodes.len();
+            nodes.push(Node {
+                name: Some(name.clone()),
+                edge_length: 1.0,
+                parent: Some(root),
+                children: Vec::new(),
+            });
+            nodes[root].children.push(id);
+        }
+        Tree::finalize(nodes, root)
+    }
+
+    /// Build an **approximate tree from taxonomy lineage strings**.
+    ///
+    /// Each taxon maps to a semicolon-delimited lineage, e.g.
+    /// `"k__Bacteria;p__Firmicutes;c__Clostridia;...;g__Bacteroides"`. Shared prefixes become
+    /// shared internal nodes, so two taxa agreeing to genus sit closer (shorter path) than two
+    /// agreeing only to phylum. Every rank edge has unit length, so path distance = number of
+    /// differing ranks — a coarse but genuinely phylogeny-aware ground metric when no real tree
+    /// exists. Empty/blank ranks are skipped; a taxon whose lineage is entirely empty attaches
+    /// directly to the root.
+    ///
+    /// `taxa` and `lineages` are parallel arrays of equal length.
+    pub fn build_from_taxonomy(
+        taxa: &[String],
+        lineages: &[String],
+    ) -> Result<Tree, TreeError> {
+        if taxa.is_empty() {
+            return Err(TreeError::NoLeaves);
+        }
+        if taxa.len() != lineages.len() {
+            return Err(TreeError::Parse {
+                pos: 0,
+                msg: format!(
+                    "taxa ({}) and lineages ({}) length mismatch",
+                    taxa.len(),
+                    lineages.len()
+                ),
+            });
+        }
+
+        let mut nodes = vec![Node {
+            name: None,
+            edge_length: 0.0,
+            parent: None,
+            children: Vec::new(),
+        }];
+        let root = 0;
+
+        // Intern internal nodes by their cumulative lineage path so shared prefixes merge.
+        // Key: the full path string up to and including a rank.
+        let mut internal: HashMap<String, NodeId> = HashMap::new();
+
+        for (taxon, lineage) in taxa.iter().zip(lineages.iter()) {
+            // ranks: non-empty, trimmed segments
+            let ranks: Vec<&str> = lineage
+                .split(';')
+                .map(|r| r.trim())
+                .filter(|r| !r.is_empty())
+                .collect();
+
+            // Walk/create the internal chain for the ranks, then attach the taxon leaf.
+            let mut parent = root;
+            let mut path_key = String::new();
+            for rank in &ranks {
+                path_key.push_str(rank);
+                path_key.push(';');
+                let node_id = match internal.get(&path_key) {
+                    Some(&id) => id,
+                    None => {
+                        let id = nodes.len();
+                        nodes.push(Node {
+                            name: None, // internal taxonomy node, unnamed
+                            edge_length: 1.0,
+                            parent: Some(parent),
+                            children: Vec::new(),
+                        });
+                        nodes[parent].children.push(id);
+                        internal.insert(path_key.clone(), id);
+                        id
+                    }
+                };
+                parent = node_id;
+            }
+
+            // attach the taxon as a leaf under the last rank node (or root if no ranks)
+            let leaf_id = nodes.len();
+            nodes.push(Node {
+                name: Some(taxon.clone()),
+                edge_length: 1.0,
+                parent: Some(parent),
+                children: Vec::new(),
+            });
+            nodes[parent].children.push(leaf_id);
+        }
+
+        Tree::finalize(nodes, root)
+    }
+
+    /// Shared construction tail: validate edge lengths, collect leaves + name index, and
+    /// precompute the post-order. Used by every tree builder.
+    fn finalize(nodes: Vec<Node>, root: NodeId) -> Result<Tree, TreeError> {
         for node in &nodes {
             if node.edge_length < 0.0 {
                 return Err(TreeError::NegativeEdge(node.edge_length));
             }
         }
 
-        // collect leaves + index (stable pre-order-ish: just node-id order, which is
-        // deterministic from the parse)
         let mut leaves = Vec::new();
         let mut leaf_index = HashMap::new();
         for (id, node) in nodes.iter().enumerate() {
@@ -484,5 +607,99 @@ mod tests {
         // one edge (A above root), cumulative mass 1.0
         assert_eq!(s.len(), t.num_edges());
         assert_abs_diff_eq!(s[0], 1.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn star_tree_reduces_to_l1() {
+        // Under a star tree, each edge's cumulative mass is a single leaf mass, so the
+        // tree-Wasserstein objective equals the L1 distance between the two distributions.
+        let taxa: Vec<String> = ["A", "B", "C", "D"].iter().map(|s| s.to_string()).collect();
+        let t = Tree::build_star(&taxa).unwrap();
+        assert_eq!(t.num_leaves(), 4);
+        assert_eq!(t.num_edges(), 4); // 4 leaf edges, no internal edges
+        let p = [0.4, 0.3, 0.2, 0.1];
+        let q = [0.1, 0.2, 0.3, 0.4];
+        let ell = t.edge_lengths(); // all 1.0
+        let sp = t.cumulative_masses(&p);
+        let sq = t.cumulative_masses(&q);
+        // objective = Σ ℓ_e |sp_e - sq_e|  should equal Σ_j |p_j - q_j|
+        let tw: f64 = ell
+            .iter()
+            .zip(sp.iter().zip(sq.iter()))
+            .map(|(l, (a, b))| l * (a - b).abs())
+            .sum();
+        let l1: f64 = p.iter().zip(q.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert_abs_diff_eq!(tw, l1, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn star_tree_accepts_noninformative_ids() {
+        // Arbitrary unique OTU ids work as leaf names.
+        let taxa: Vec<String> = ["OTU_1", "OTU_2", "abc123hash"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let t = Tree::build_star(&taxa).unwrap();
+        assert!(t.leaf_by_name("OTU_1").is_some());
+        assert!(t.leaf_by_name("abc123hash").is_some());
+    }
+
+    #[test]
+    fn taxonomy_tree_places_relatives_closer() {
+        // A and B share genus; C shares only phylum. Path distance A-B < A-C.
+        let taxa: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
+        let lineages = vec![
+            "k__Bac;p__Firm;g__Bacteroides".to_string(),
+            "k__Bac;p__Firm;g__Bacteroides".to_string(),
+            "k__Bac;p__Proteo;g__E".to_string(),
+        ];
+        let t = Tree::build_from_taxonomy(&taxa, &lineages).unwrap();
+        assert_eq!(t.num_leaves(), 3);
+
+        // topological path length between two leaves (sum of edge lengths on the path via LCA)
+        let depth = |name: &str| -> Vec<NodeId> {
+            let mut n = t.leaf_by_name(name).unwrap();
+            let mut path = vec![n];
+            while let Some(p) = t.nodes[n].parent {
+                path.push(p);
+                n = p;
+            }
+            path
+        };
+        let path_dist = |x: &str, y: &str| -> f64 {
+            let px = depth(x);
+            let py: std::collections::HashSet<NodeId> = depth(y).into_iter().collect();
+            // distance = (edges from x up to LCA) + (edges from y up to LCA)
+            // compute via counting: sum of edge lengths from x to LCA and y to LCA
+            // find LCA as first node in px that is in py
+            let lca = *px.iter().find(|n| py.contains(n)).unwrap();
+            let up = |leaf: &str| -> f64 {
+                let mut n = t.leaf_by_name(leaf).unwrap();
+                let mut d = 0.0;
+                while n != lca {
+                    d += t.nodes[n].edge_length;
+                    n = t.nodes[n].parent.unwrap();
+                }
+                d
+            };
+            up(x) + up(y)
+        };
+
+        let d_ab = path_dist("A", "B");
+        let d_ac = path_dist("A", "C");
+        assert!(
+            d_ab < d_ac,
+            "same-genus pair (d={d_ab}) should be closer than cross-phylum pair (d={d_ac})"
+        );
+    }
+
+    #[test]
+    fn taxonomy_empty_lineage_attaches_to_root() {
+        let taxa: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let lineages = vec!["".to_string(), "k__Bac;g__X".to_string()];
+        let t = Tree::build_from_taxonomy(&taxa, &lineages).unwrap();
+        // A attaches directly to root
+        let a = t.leaf_by_name("A").unwrap();
+        assert_eq!(t.nodes[a].parent, Some(t.root));
     }
 }

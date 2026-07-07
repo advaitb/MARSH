@@ -237,4 +237,16 @@ unbalanced-OT extension.
 - Verify no existing "OT / tree-Wasserstein source tracking" tool already exists before making
   novelty claims (search the literature; it moves fast).
 - Confirm the chosen LP crate is maintained and fast enough for B×(repeated) solves.
+  → **RESOLVED (M1):** `good_lp 1.15` + `microlp 0.4` (pure Rust). Verified by a compiled probe
+    to solve the LAD LP exactly. Kept behind the `LpSolver` trait so it can be swapped.
 - Decide taxa-vs-tree mismatch policy with the user.
+  → **RESOLVED (M1 / M1.5):** taxa are matched to tree leaves by exact name. Unmatched table
+    taxa are an **error by default** (`--on-missing error`), or dropped and reported with
+    `--on-missing drop`. Tree leaves absent from the tables get count 0. When no phylogeny is
+    available or IDs are non-informative, the CLI requires exactly one tree source and offers
+    two loud, opt-in fallbacks to a Newick file:
+    - `--star-tree`: flat star over observed taxa → the loss reduces to **L1 deconvolution**
+      (drift-robustness OFF; warned in output metadata). This is also the non-OT ablation.
+    - `--taxonomy <FILE>`: approximate tree from `taxon<TAB>lineage` (`;`-delimited ranks);
+      ground metric = number of differing ranks. Partial phylogeny without a tree file.
+    The output metadata records `phylogeny` (`newick`/`star`/`taxonomy`) and `warnings`.
