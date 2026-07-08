@@ -10,12 +10,14 @@
 //! 3. Compute per-edge cumulative masses and solve the LAD LP ([`estimate`], [`lp`]).
 //! 4. (M2) Wrap in a multinomial bootstrap for uncertainty.
 
+pub mod baseline;
 pub mod bootstrap;
 pub mod cli;
 pub mod estimate;
 pub mod io;
 pub mod lp;
 pub mod profile;
+pub mod sim;
 pub mod tree;
 pub mod unknown;
 

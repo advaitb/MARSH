@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "otst"
 path = "src/main.rs"
 
+[[bin]]
+name = "otst-experiments"
+path = "src/bin/experiments.rs"
+
 [dependencies]
 # LP solver: good_lp front-end + microlp backend (pure Rust, no C deps).
 # Verified 2026-07-07 to compile and solve the LAD tree-Wasserstein LP exactly.
@@ -29,6 +33,11 @@ thiserror = "2"
 
 [dev-dependencies]
 approx = "0.5"
+criterion = "0.8"
+
+[[bench]]
+name = "bootstrap_bench"
+harness = false
 
 [profile.release]
 opt-level = 3
