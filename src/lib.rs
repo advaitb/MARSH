@@ -13,6 +13,7 @@
 pub mod baseline;
 pub mod bootstrap;
 pub mod cli;
+pub mod cluster;
 pub mod estimate;
 pub mod io;
 pub mod lp;
@@ -20,6 +21,7 @@ pub mod profile;
 pub mod sim;
 pub mod tree;
 pub mod unknown;
+pub mod unmix;
 
 pub use bootstrap::{BootstrapConfig, BootstrapResult, IntervalMethod, SourceInterval};
 pub use estimate::{point_estimate, PointEstimate, Prepared, SourceEstimate};
@@ -27,3 +29,4 @@ pub use lp::{GoodLpSolver, LadProblem, LadSolution, LpError, LpSolver, WeightCon
 pub use profile::{Profile, SourceSet};
 pub use tree::{Tree, TreeError};
 pub use unknown::UnknownMode;
+pub use unmix::{alternating_estimate, UnmixConfig, UnmixResult};

@@ -24,6 +24,9 @@ pub struct Prepared<'t> {
     pub background: Option<Vec<f64>>,
     /// Number of *named* sources (excludes the background source).
     pub num_named: usize,
+    /// Optional per-LP-source reweighted-L1 penalty `μ_k` (length `num_lp_sources()`, empty =
+    /// none). Threaded into every LP solve; set by the alternating unmixer between iterations.
+    pub weight_penalty: Vec<f64>,
 }
 
 impl<'t> Prepared<'t> {
@@ -53,6 +56,28 @@ impl<'t> Prepared<'t> {
             lambda,
             background,
             num_named,
+            weight_penalty: Vec::new(),
+        }
+    }
+
+    /// Build a prepared problem with an *explicit* background profile `b_0` appended as the
+    /// (K+1)-th source (`Σ w = 1`). Unlike [`Self::new`], the profile is supplied by the caller
+    /// rather than derived from an [`UnknownMode`] — this is how the alternating unmixer
+    /// (spec §2.4 outer loop) re-solves against a freshly estimated unknown profile each
+    /// iteration while reusing the fixed tree/edge setup.
+    pub fn with_background(tree: &'t Tree, sources: &SourceSet, background: Vec<f64>) -> Self {
+        let edge_lengths = tree.edge_lengths();
+        let mut source_names = sources.names.clone();
+        source_names.push(UNKNOWN_LABEL.to_string());
+        Prepared {
+            tree,
+            edge_lengths,
+            source_names,
+            mode: UnknownMode::Estimated,
+            lambda: 0.0,
+            background: Some(background),
+            num_named: sources.num_sources(),
+            weight_penalty: Vec::new(),
         }
     }
 
@@ -109,6 +134,7 @@ impl<'t> Prepared<'t> {
             num_sources: self.num_lp_sources(),
             constraint: self.weight_constraint(),
             deficit_penalty: self.lambda,
+            weight_penalty: &self.weight_penalty,
         };
         solver.solve(&problem)
     }

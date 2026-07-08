@@ -8,10 +8,66 @@
 
 use otst::baseline::l2_deconvolve;
 use otst::bootstrap::{self, BootstrapConfig, IntervalMethod};
+use otst::cluster::{build_cluster_tree, TaxonDistance};
 use otst::estimate::Prepared;
 use otst::lp::GoodLpSolver;
 use otst::sim::{generate, l1_error, Scenario, SimConfig};
+use otst::tree::Tree;
 use otst::unknown::UnknownMode;
+
+/// Solve OTST against an ARBITRARY tree (not the scenario's own), aligning by leaf name. Used to
+/// compare true-tree vs cluster-tree vs star-tree on the same drifted data.
+fn solve_ot_with_tree(sc: &Scenario, tree: &Tree) -> Vec<f64> {
+    let prepared = Prepared::new(tree, &sc.sources, UnknownMode::None, 0.0);
+    // sources/sink in the scenario are in the scenario tree's leaf order (T0..T{D-1}); the
+    // alternative trees use the same leaf names, and Prepared/cumulative_masses index by the
+    // tree's own leaf order, so we must re-map profiles into `tree`'s leaf order.
+    let remap = |vec_in_sc_order: &[f64]| -> Vec<f64> {
+        let mut out = vec![0.0; tree.num_leaves()];
+        for (sc_pos, &node) in sc.tree.leaves().iter().enumerate() {
+            let name = sc.tree.nodes[node].name.as_ref().unwrap();
+            if let Some(tnode) = tree.leaf_by_name(name) {
+                // position of tnode in `tree`'s leaf order
+                let tpos = tree.leaves().iter().position(|&n| n == tnode).unwrap();
+                out[tpos] = vec_in_sc_order[sc_pos];
+            }
+        }
+        out
+    };
+    let src: Vec<Vec<f64>> = sc
+        .sources
+        .profiles
+        .iter()
+        .map(|p| remap(&p.normalized()))
+        .collect();
+    let sink = remap(&sc.sink.normalized());
+    prepared.solve(&GoodLpSolver, &src, &sink).unwrap().weights
+}
+
+/// Build a co-abundance cluster tree from a scenario's source + sink count vectors.
+fn cluster_tree_for(sc: &Scenario) -> Tree {
+    let taxa: Vec<String> = sc
+        .tree
+        .leaves()
+        .iter()
+        .map(|&n| sc.tree.nodes[n].name.clone().unwrap())
+        .collect();
+    // samples = each source profile + the sink (counts)
+    let mut samples: Vec<Vec<f64>> = sc.sources.profiles.iter().map(|p| p.counts.clone()).collect();
+    samples.push(sc.sink.counts.clone());
+    build_cluster_tree(&taxa, &samples, TaxonDistance::Correlation).unwrap()
+}
+
+/// Star tree over a scenario's taxa.
+fn star_tree_for(sc: &Scenario) -> Tree {
+    let taxa: Vec<String> = sc
+        .tree
+        .leaves()
+        .iter()
+        .map(|&n| sc.tree.nodes[n].name.clone().unwrap())
+        .collect();
+    Tree::build_star(&taxa).unwrap()
+}
 
 fn solve_ot(sc: &Scenario) -> Vec<f64> {
     let prepared = Prepared::new(&sc.tree, &sc.sources, UnknownMode::None, 0.0);
@@ -135,21 +191,61 @@ fn report_coverage(label: &str, drift: f64) {
     );
 }
 
+/// Experiment 5: does a data-driven CLUSTER tree recover the true tree's drift-robustness when
+/// no phylogeny is provided? Compares, on the SAME drifted data, OTST with the true tree, a
+/// co-abundance cluster tree, a star tree, and the L2 baseline. This is the experiment that
+/// justifies the `--cluster-tree` improvement discovered during benchmarking.
+fn cluster_tree_sweep() {
+    println!("# Experiment 5: cluster tree vs star vs true tree under phylogenetic drift");
+    println!("drift\tOT_true\tOT_cluster\tOT_star\tL2");
+    let base = SimConfig {
+        num_taxa: 48,
+        num_sources: 4,
+        dirichlet_alpha: 0.3,
+        sink_depth: 20_000,
+        source_depth: 20_000,
+        ..Default::default()
+    };
+    let n = 15;
+    for i in 0..=6 {
+        let drift = i as f64 * 0.05;
+        let cfg = SimConfig { drift, ..base.clone() };
+        let (mut t_true, mut t_clust, mut t_star, mut t_l2) = (0.0, 0.0, 0.0, 0.0);
+        for s in 0..n {
+            let sc = generate(&cfg, s * 100 + 1);
+            t_true += l1_error(&solve_ot(&sc), &sc.true_weights);
+            let ct = cluster_tree_for(&sc);
+            t_clust += l1_error(&solve_ot_with_tree(&sc, &ct), &sc.true_weights);
+            let st = star_tree_for(&sc);
+            t_star += l1_error(&solve_ot_with_tree(&sc, &st), &sc.true_weights);
+            t_l2 += l1_error(&solve_l2(&sc), &sc.true_weights);
+        }
+        let n = n as f64;
+        println!(
+            "{:.2}\t{:.4}\t{:.4}\t{:.4}\t{:.4}",
+            drift, t_true / n, t_clust / n, t_star / n, t_l2 / n
+        );
+    }
+}
+
 fn main() {
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".to_string());
     match which.as_str() {
         "drift" => drift_sweep(),
         "depth" => depth_sweep(),
         "coverage" => coverage(),
+        "clustertree" => cluster_tree_sweep(),
         "all" => {
             drift_sweep();
             println!();
             depth_sweep();
             println!();
             coverage();
+            println!();
+            cluster_tree_sweep();
         }
         other => {
-            eprintln!("unknown experiment {other:?}; use: drift | depth | coverage | all");
+            eprintln!("unknown experiment {other:?}; use: drift | depth | coverage | clustertree | all");
             std::process::exit(1);
         }
     }

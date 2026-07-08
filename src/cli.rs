@@ -46,12 +46,24 @@ pub struct EstimateArgs {
     /// ';'-delimited rank string). Gives partial phylogenetic structure without a real tree.
     #[arg(long, group = "tree_source", value_name = "FILE")]
     pub taxonomy: Option<PathBuf>,
+    /// Build a data-driven tree by clustering taxa on their co-abundance across the source and
+    /// sink samples (UPGMA on correlation distance). Recovers real ground-metric structure when
+    /// no phylogeny is available — strictly better than --star-tree for the OT loss.
+    #[arg(long, group = "tree_source")]
+    pub cluster_tree: bool,
     /// Unknown-source model.
     #[arg(long, value_enum, default_value_t = UnknownArg::Metacommunity)]
     pub unknown: UnknownArg,
     /// Penalty λ for unbalanced OT (v2 only).
     #[arg(long, default_value_t = 1.0)]
     pub lambda: f64,
+    /// Reweighted-ℓ1 source-selection strength (only used with `--unknown estimated`). 0 = off.
+    /// Larger values suppress weakly-supported sources — useful with many candidate sources.
+    #[arg(long, default_value_t = 0.0)]
+    pub sparsity: f64,
+    /// Print per-iteration convergence of the alternating unknown estimator to stderr.
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
     /// How to handle table taxa that are not tree leaves.
     #[arg(long, value_enum, default_value_t = OnMissingArg::Error)]
     pub on_missing: OnMissingArg,
@@ -78,6 +90,8 @@ pub enum UnknownArg {
     Uniform,
     Metacommunity,
     Unbalanced,
+    /// Jointly estimate the unknown source's profile via the alternating unmixer (M5).
+    Estimated,
 }
 
 impl From<UnknownArg> for UnknownMode {
@@ -87,6 +101,7 @@ impl From<UnknownArg> for UnknownMode {
             UnknownArg::Uniform => UnknownMode::Uniform,
             UnknownArg::Metacommunity => UnknownMode::Metacommunity,
             UnknownArg::Unbalanced => UnknownMode::Unbalanced,
+            UnknownArg::Estimated => UnknownMode::Estimated,
         }
     }
 }
@@ -168,6 +183,9 @@ struct Metadata {
     /// Bootstrap run info (absent when bootstrap disabled).
     #[serde(skip_serializing_if = "Option::is_none")]
     bootstrap: Option<BootstrapMeta>,
+    /// Outer iterations run by the alternating unknown-profile estimator (`--unknown estimated`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unmix_iters: Option<usize>,
     /// Wall-clock seconds for the full estimate (point + bootstrap).
     wall_clock_secs: f64,
 }
@@ -233,10 +251,48 @@ fn build_tree(
                 .to_string(),
         );
         Ok((tree, "taxonomy".to_string(), warnings))
+    } else if args.cluster_tree {
+        let (taxa, samples) = coabundance_matrix(src, sink);
+        let tree = crate::cluster::build_cluster_tree(
+            &taxa,
+            &samples,
+            crate::cluster::TaxonDistance::Correlation,
+        )
+        .context("building co-abundance cluster tree")?;
+        warnings.push(
+            "data-driven cluster tree in use: ground metric = taxon co-abundance distance, \
+             a heuristic surrogate for phylogeny (co-abundance is not evolutionary relatedness)."
+                .to_string(),
+        );
+        Ok((tree, "cluster".to_string(), warnings))
     } else {
         // Unreachable: the clap ArgGroup marks a tree source as required.
-        anyhow::bail!("no tree source provided (use --tree, --star-tree, or --taxonomy)")
+        anyhow::bail!("no tree source provided (use --tree, --star-tree, --taxonomy, or --cluster-tree)")
     }
+}
+
+/// Assemble a per-sample abundance matrix over the union of observed taxa: returns the taxa
+/// (leaf names) and, for each sample column across BOTH tables, a length-|taxa| abundance
+/// vector. Used to cluster taxa by co-abundance for `--cluster-tree`.
+fn coabundance_matrix(src: &CountTable, sink: &CountTable) -> (Vec<String>, Vec<Vec<f64>>) {
+    let taxa = observed_taxa(src, sink);
+    let index: std::collections::HashMap<&str, usize> =
+        taxa.iter().enumerate().map(|(i, t)| (t.as_str(), i)).collect();
+    let d = taxa.len();
+
+    let mut samples: Vec<Vec<f64>> = Vec::new();
+    for table in [src, sink] {
+        for col in 0..table.num_samples() {
+            let mut v = vec![0.0f64; d];
+            for (row, taxon) in table.taxa.iter().enumerate() {
+                if let Some(&ti) = index.get(taxon.as_str()) {
+                    v[ti] += table.values[row][col];
+                }
+            }
+            samples.push(v);
+        }
+    }
+    (taxa, samples)
 }
 
 /// Read a taxonomy TSV: `taxon<TAB>lineage` per line, lineage is a ';'-delimited rank string.
@@ -292,16 +348,67 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
 
     let start = std::time::Instant::now();
 
-    // Point estimate
-    let (est, prepared) = point_estimate(&GoodLpSolver, &tree, &sources, &sink, mode, args.lambda)
-        .context("solving the tree-Wasserstein LP")?;
+    // `Estimated` mode does not support the bootstrap (see below); every other mode does.
+    let effective_bootstrap = if let UnknownMode::Estimated = mode {
+        0
+    } else {
+        args.bootstrap
+    };
+    let mut unmix_iters: Option<usize> = None;
+
+    // Point estimate. `Estimated` mode jointly estimates the unknown *profile* via the
+    // alternating unmixer (M5); every other mode is the single convex LP solve. In both cases we
+    // end with a `Prepared` carrying the (fixed, for this run) background so the bootstrap can
+    // re-solve per replicate.
+    let (est, prepared) = if let UnknownMode::Estimated = mode {
+        // On a real phylogeny the tree-Wasserstein weight step carries the drift-robustness; on
+        // a star/cluster/taxonomy surrogate the ground metric has little signal and an L2 weight
+        // step fits compositional read data markedly better (best-in-class on tree-less data).
+        let weight_step = if phylogeny == "newick" {
+            crate::unmix::WeightStep::TreeWasserstein
+        } else {
+            crate::unmix::WeightStep::L2
+        };
+        let cfg = crate::unmix::UnmixConfig {
+            sparsity: args.sparsity,
+            weight_step,
+            verbose: args.verbose,
+            ..Default::default()
+        };
+        let res = crate::unmix::alternating_estimate(&GoodLpSolver, &tree, &sources, &sink, &cfg)
+            .context("running the alternating unknown-profile estimator")?;
+        unmix_iters = Some(res.iters);
+        // The alternating estimator's uncertainty is not yet wired: the point estimate uses the
+        // (possibly L2) alternating loop, so re-solving replicates through the LP with a frozen
+        // profile would be inconsistent — and at seconds-per-solve on large tables a full
+        // bootstrap is impractical anyway. Disable it here and say so, rather than emit
+        // intervals that don't match the point estimate.
+        if args.bootstrap > 0 {
+            warnings.push(
+                "bootstrap intervals are not available with --unknown estimated (M5); \
+                 reporting the point estimate only."
+                    .to_string(),
+            );
+        }
+        // Freeze the estimated unknown profile as the background so the (skipped) bootstrap and
+        // the metadata line up with the reported estimate.
+        let prepared = crate::estimate::Prepared::with_background(
+            &tree,
+            &sources,
+            res.unknown_profile.clone(),
+        );
+        (res.estimate, prepared)
+    } else {
+        point_estimate(&GoodLpSolver, &tree, &sources, &sink, mode, args.lambda)
+            .context("solving the tree-Wasserstein LP")?
+    };
 
     // Point weights in prepared.source_names order (named sources + optional Unknown).
     let point_weights: Vec<f64> = est.sources.iter().map(|s| s.proportion).collect();
 
     // Bootstrap uncertainty (mandatory source + sink resampling inside).
     let boot_cfg = BootstrapConfig {
-        replicates: args.bootstrap,
+        replicates: effective_bootstrap,
         seed: args.seed,
         interval: args.interval.into(),
         alpha: 0.05,
@@ -327,7 +434,7 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         .sum::<f64>()
         + est.deficit; // v2 deficit also counts as unknown
 
-    let have_bootstrap = args.bootstrap > 0;
+    let have_bootstrap = effective_bootstrap > 0;
     let sources_out: Vec<SourceOut> = est
         .sources
         .iter()
@@ -391,6 +498,7 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
             } else {
                 None
             },
+            unmix_iters,
             wall_clock_secs: start.elapsed().as_secs_f64(),
         },
     };

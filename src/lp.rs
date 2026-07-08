@@ -59,6 +59,13 @@ pub struct LadProblem<'a> {
     /// v2 only: penalty rate `λ` on the unexplained deficit `1 − Σ w_k`. Ignored when
     /// `constraint == SumToOne`.
     pub deficit_penalty: f64,
+    /// Optional per-source linear penalty `μ_k`, added to the objective as `Σ_k μ_k w_k`. Empty
+    /// slice = no penalty (the common case). Used by the alternating unmixer's reweighted-L1
+    /// source selection (spec §2.4 outer loop): setting `μ_k = c/(w_k+ε)` from the previous
+    /// iterate drives negligible weights toward zero while keeping the solve a linear program
+    /// (the term is linear in `w`, so per-`μ` global optimality is preserved). When non-empty,
+    /// its length must equal `num_sources`.
+    pub weight_penalty: &'a [f64],
 }
 
 /// The result of solving a [`LadProblem`].
@@ -137,6 +144,17 @@ impl LpSolver for GoodLpSolver {
         if problem.constraint == WeightConstraint::AtMostOne && problem.deficit_penalty != 0.0 {
             // λ·(1 − Σ w_k) = λ − λ·Σ w_k ; constant λ doesn't affect the argmin, drop it.
             objective += problem.deficit_penalty * (Expression::from(1.0) - wsum.clone());
+        }
+
+        // Optional reweighted-L1 source-selection penalty: Σ_k μ_k w_k (linear → stays an LP).
+        if !problem.weight_penalty.is_empty() {
+            if problem.weight_penalty.len() != k {
+                return Err(LpError::Dim(format!(
+                    "weight_penalty has {} entries, expected K={k}",
+                    problem.weight_penalty.len()
+                )));
+            }
+            objective += (0..k).map(|j| problem.weight_penalty[j] * w[j]).sum::<Expression>();
         }
 
         let mut model = vars.minimise(objective).using(default_solver);
@@ -219,6 +237,7 @@ mod tests {
             num_sources: 2,
             constraint: WeightConstraint::SumToOne,
             deficit_penalty: 0.0,
+            weight_penalty: &[],
         };
         let sol = GoodLpSolver.solve(&prob).unwrap();
         assert_abs_diff_eq!(sol.weights[0], 0.5, epsilon = 1e-6);
@@ -246,6 +265,7 @@ mod tests {
             num_sources: 2,
             constraint: WeightConstraint::SumToOne,
             deficit_penalty: 0.0,
+            weight_penalty: &[],
         };
         let sol = GoodLpSolver.solve(&prob).unwrap();
         assert_abs_diff_eq!(sol.objective, 0.0, epsilon = 1e-6);
@@ -273,6 +293,7 @@ mod tests {
             num_sources: 3,
             constraint: WeightConstraint::SumToOne,
             deficit_penalty: 0.0,
+            weight_penalty: &[],
         };
         let sol = GoodLpSolver.solve(&prob).unwrap();
 
@@ -315,6 +336,7 @@ mod tests {
             num_sources: 1,
             constraint: WeightConstraint::AtMostOne,
             deficit_penalty: 0.01, // cheap to leave mass unexplained
+            weight_penalty: &[],
         };
         let sol = GoodLpSolver.solve(&prob).unwrap();
         // weight should be <= 1 and deficit >= 0

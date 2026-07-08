@@ -26,6 +26,11 @@ pub enum UnknownMode {
     Metacommunity,
     /// Unbalanced OT: allow `Σ w_k ≤ 1`, penalize the deficit at rate `λ` (v2).
     Unbalanced,
+    /// Estimate the unknown source's *profile* jointly with the weights via an outer alternating
+    /// loop (spec §2.4): the inner tree-Wasserstein LP stays convex with `b_0` fixed each
+    /// iteration; the profile is re-estimated from the residual between iterations. The CLI
+    /// routes this mode through [`crate::unmix::alternating_estimate`], not the single LP solve.
+    Estimated,
 }
 
 /// Construct the fixed background profile `b_0` for a v1 unknown mode, or `None` when no
@@ -36,7 +41,9 @@ pub fn background_profile(
     num_taxa: usize,
 ) -> Option<Vec<f64>> {
     match mode {
-        UnknownMode::None | UnknownMode::Unbalanced => None,
+        // `Estimated` supplies its background explicitly via `Prepared::with_background`, so no
+        // mode-derived background is built here.
+        UnknownMode::None | UnknownMode::Unbalanced | UnknownMode::Estimated => None,
         UnknownMode::Uniform => Some(vec![1.0 / num_taxa as f64; num_taxa]),
         UnknownMode::Metacommunity => Some(sources.metacommunity(num_taxa)),
     }
