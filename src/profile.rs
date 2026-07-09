@@ -58,22 +58,6 @@ impl SourceSet {
     pub fn num_sources(&self) -> usize {
         self.profiles.len()
     }
-
-    /// The metacommunity profile: the mean of all normalized source profiles. Used as the
-    /// fixed background source `b_0` under `--unknown metacommunity`.
-    pub fn metacommunity(&self, num_taxa: usize) -> Vec<f64> {
-        let mut acc = vec![0.0f64; num_taxa];
-        let k = self.profiles.len().max(1);
-        for prof in &self.profiles {
-            for (i, b) in prof.normalized().iter().enumerate() {
-                acc[i] += b;
-            }
-        }
-        for v in &mut acc {
-            *v /= k as f64;
-        }
-        acc
-    }
 }
 
 #[cfg(test)]
@@ -98,19 +82,5 @@ mod tests {
         for v in n {
             assert_abs_diff_eq!(v, 0.25, epsilon = 1e-12);
         }
-    }
-
-    #[test]
-    fn metacommunity_is_mean() {
-        let ss = SourceSet {
-            names: vec!["s1".into(), "s2".into()],
-            profiles: vec![
-                Profile::from_counts(vec![10.0, 0.0]),
-                Profile::from_counts(vec![0.0, 10.0]),
-            ],
-        };
-        let mc = ss.metacommunity(2);
-        assert_abs_diff_eq!(mc[0], 0.5, epsilon = 1e-12);
-        assert_abs_diff_eq!(mc[1], 0.5, epsilon = 1e-12);
     }
 }

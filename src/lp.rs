@@ -15,8 +15,7 @@
 //! minimize   Σ_e t_e
 //! s.t.       t_e ≥  ℓ_e (s_e − Σ_k M_ek w_k)
 //!            t_e ≥ −ℓ_e (s_e − Σ_k M_ek w_k)
-//!            w_k ≥ 0,   Σ_k w_k = 1        (v1: SumToOne)
-//!                       Σ_k w_k ≤ 1        (v2: AtMostOne, unbalanced)
+//!            w_k ≥ 0,   Σ_k w_k = 1
 //! ```
 //!
 //! This is a convex LP → global optimum, the headline contrast with EM/NMF methods. The
@@ -34,17 +33,8 @@ pub enum LpError {
     Solver(String),
 }
 
-/// The simplex constraint mode for the mixing weights.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WeightConstraint {
-    /// `Σ_k w_k = 1` (v1: all sink mass is explained, possibly by a fixed background source).
-    SumToOne,
-    /// `Σ_k w_k ≤ 1` (v2: unbalanced OT; the deficit is unexplained mass). The deficit is
-    /// penalized by adding a slack term to the objective, wired by the caller.
-    AtMostOne,
-}
-
-/// A fully specified LAD LP instance.
+/// A fully specified LAD LP instance. The mixing weights are always on the simplex
+/// (`w_k ≥ 0, Σ_k w_k = 1`); an unknown source, when modeled, is one of the columns of `M`.
 pub struct LadProblem<'a> {
     /// Edge weights `ℓ_e`, length E.
     pub edge_lengths: &'a [f64],
@@ -54,11 +44,6 @@ pub struct LadProblem<'a> {
     pub source_cum: &'a [Vec<f64>],
     /// Number of sources K.
     pub num_sources: usize,
-    /// Weight-sum constraint mode.
-    pub constraint: WeightConstraint,
-    /// v2 only: penalty rate `λ` on the unexplained deficit `1 − Σ w_k`. Ignored when
-    /// `constraint == SumToOne`.
-    pub deficit_penalty: f64,
     /// Optional per-source linear penalty `μ_k`, added to the objective as `Σ_k μ_k w_k`. Empty
     /// slice = no penalty (the common case). Used by the alternating unmixer's reweighted-L1
     /// source selection (spec §2.4 outer loop): setting `μ_k = c/(w_k+ε)` from the previous
@@ -73,11 +58,8 @@ pub struct LadProblem<'a> {
 pub struct LadSolution {
     /// Mixing weights `w`, length K.
     pub weights: Vec<f64>,
-    /// Objective value `Σ_e ℓ_e |residual_e|` (the tree-Wasserstein distance at the optimum;
-    /// for v2 this excludes the deficit-penalty term — see [`Self::deficit`]).
+    /// Objective value `Σ_e ℓ_e |residual_e|` — the tree-Wasserstein distance at the optimum.
     pub objective: f64,
-    /// v2 only: the unexplained deficit `1 − Σ w_k` (≈ 0 for v1).
-    pub deficit: f64,
 }
 
 /// A swappable LP backend.
@@ -136,15 +118,8 @@ impl LpSolver for GoodLpSolver {
         let w: Vec<_> = (0..k).map(|_| vars.add(variable().min(0.0))).collect();
         let t: Vec<_> = (0..e).map(|_| vars.add(variable().min(0.0))).collect();
 
-        // Objective: Σ t_e  (+ λ·deficit for v2).
+        // Objective: Σ t_e.
         let mut objective: Expression = t.iter().sum();
-
-        // deficit = 1 − Σ w_k  (only meaningful for AtMostOne; for SumToOne it is exactly 0).
-        let wsum: Expression = w.iter().sum();
-        if problem.constraint == WeightConstraint::AtMostOne && problem.deficit_penalty != 0.0 {
-            // λ·(1 − Σ w_k) = λ − λ·Σ w_k ; constant λ doesn't affect the argmin, drop it.
-            objective += problem.deficit_penalty * (Expression::from(1.0) - wsum.clone());
-        }
 
         // Optional reweighted-L1 source-selection penalty: Σ_k μ_k w_k (linear → stays an LP).
         if !problem.weight_penalty.is_empty() {
@@ -159,14 +134,9 @@ impl LpSolver for GoodLpSolver {
 
         let mut model = vars.minimise(objective).using(default_solver);
 
-        match problem.constraint {
-            WeightConstraint::SumToOne => {
-                model = model.with(constraint!(wsum.clone() == 1.0));
-            }
-            WeightConstraint::AtMostOne => {
-                model = model.with(constraint!(wsum.clone() <= 1.0));
-            }
-        }
+        // Simplex constraint: Σ_k w_k = 1.
+        let wsum: Expression = w.iter().sum();
+        model = model.with(constraint!(wsum == 1.0));
 
         // Per-edge |·| linearization. Indexing by edge `i` reads several parallel arrays
         // (t, source_cum, edge_lengths, sink_cum), so an index loop is clearest here.
@@ -193,8 +163,6 @@ impl LpSolver for GoodLpSolver {
                 *wv = 0.0;
             }
         }
-        let sum_w: f64 = weights.iter().sum();
-        let deficit = (1.0 - sum_w).max(0.0);
 
         // Report the *pure* tree-Wasserstein distance, recomputed from weights (independent of
         // the solver's slack variables — robust to solver-internal scaling).
@@ -205,11 +173,7 @@ impl LpSolver for GoodLpSolver {
             &weights,
         );
 
-        Ok(LadSolution {
-            weights,
-            objective,
-            deficit,
-        })
+        Ok(LadSolution { weights, objective })
     }
 }
 
@@ -235,8 +199,6 @@ mod tests {
             sink_cum: &s,
             source_cum: &m,
             num_sources: 2,
-            constraint: WeightConstraint::SumToOne,
-            deficit_penalty: 0.0,
             weight_penalty: &[],
         };
         let sol = GoodLpSolver.solve(&prob).unwrap();
@@ -263,8 +225,6 @@ mod tests {
             sink_cum: &s,
             source_cum: &m,
             num_sources: 2,
-            constraint: WeightConstraint::SumToOne,
-            deficit_penalty: 0.0,
             weight_penalty: &[],
         };
         let sol = GoodLpSolver.solve(&prob).unwrap();
@@ -291,8 +251,6 @@ mod tests {
             sink_cum: &s,
             source_cum: &m,
             num_sources: 3,
-            constraint: WeightConstraint::SumToOne,
-            deficit_penalty: 0.0,
             weight_penalty: &[],
         };
         let sol = GoodLpSolver.solve(&prob).unwrap();
@@ -321,26 +279,5 @@ mod tests {
         // And the LP objective recomputed from its weights is self-consistent.
         let recomputed = tree_wasserstein_objective(&ell, &s, &m, &sol.weights);
         assert_abs_diff_eq!(sol.objective, recomputed, epsilon = 1e-9);
-    }
-
-    #[test]
-    fn unbalanced_allows_deficit() {
-        // If no mixture explains the sink well and λ is small, v2 may leave a deficit.
-        let ell = vec![1.0, 1.0];
-        let s = vec![0.5, 0.5];
-        let m = vec![vec![1.0], vec![1.0]]; // single source, cumulative mass 1 on both edges
-        let prob = LadProblem {
-            edge_lengths: &ell,
-            sink_cum: &s,
-            source_cum: &m,
-            num_sources: 1,
-            constraint: WeightConstraint::AtMostOne,
-            deficit_penalty: 0.01, // cheap to leave mass unexplained
-            weight_penalty: &[],
-        };
-        let sol = GoodLpSolver.solve(&prob).unwrap();
-        // weight should be <= 1 and deficit >= 0
-        assert!(sol.weights[0] <= 1.0 + 1e-6);
-        assert!(sol.deficit >= -1e-6);
     }
 }

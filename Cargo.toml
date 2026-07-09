@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "otst-experiments"
 path = "src/bin/experiments.rs"
 
+[[bin]]
+name = "export-sim"
+path = "src/bin/export_sim.rs"
+
 [dependencies]
 # LP solver: good_lp front-end + microlp backend (pure Rust, no C deps).
 # Verified 2026-07-07 to compile and solve the LAD tree-Wasserstein LP exactly.

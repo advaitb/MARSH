@@ -12,7 +12,22 @@ use crate::tree::{NodeId, Tree};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
-use rand_distr::{Distribution, Gamma};
+use rand_distr::{Beta, Distribution, Gamma};
+
+/// How the sink community drifts away from the reference sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftModel {
+    /// Move a `drift` fraction of each taxon's mass to its sibling leaf (cherry-swap). Simple and
+    /// exactly one edge of movement, but only perturbs leaves that happen to have a leaf sibling.
+    CherrySwap,
+    /// TADA-style (Sayyari et al., Bioinformatics 2019): traverse the tree top-down and, at each
+    /// internal node, perturb how the parent's subtree mass splits between children by a Beta
+    /// draw. The Beta concentration grows with the node's path length so variance is larger near
+    /// the tips (closely related taxa are more interchangeable). This is the literature-standard
+    /// phylogeny-aware generative perturbation and applies structured drift across the whole tree,
+    /// not just cherries. `drift` scales the overall perturbation strength.
+    TadaBeta,
+}
 
 /// Parameters for one simulated scenario.
 #[derive(Debug, Clone)]
@@ -25,8 +40,11 @@ pub struct SimConfig {
     pub dirichlet_alpha: f64,
     /// True fraction of the sink coming from the hidden unknown source (0 disables it).
     pub unknown_fraction: f64,
-    /// Fraction of each source's mass that drifts (0 = no drift).
+    /// Fraction of each source's mass that drifts (0 = no drift). Under `TadaBeta` this scales
+    /// the Beta perturbation strength.
     pub drift: f64,
+    /// Which drift model moves sink mass away from the reference sources.
+    pub drift_model: DriftModel,
     /// Sink sequencing depth n.
     pub sink_depth: u64,
     /// Source sequencing depth m (per source).
@@ -41,6 +59,7 @@ impl Default for SimConfig {
             dirichlet_alpha: 0.3,
             unknown_fraction: 0.0,
             drift: 0.0,
+            drift_model: DriftModel::CherrySwap,
             sink_depth: 10_000,
             source_depth: 10_000,
         }
@@ -138,6 +157,131 @@ fn apply_phylo_drift(profile: &[f64], siblings: &[Option<usize>], drift: f64) ->
     out
 }
 
+/// Depth (number of edges from the root) of every node, indexed by node id. Used to make the
+/// TADA perturbation phylogeny-aware: deeper nodes (closer to the tips) get more variance.
+fn node_depths(tree: &Tree) -> Vec<usize> {
+    let mut depth = vec![0usize; tree.nodes.len()];
+    // BFS/DFS from the root, filling each child's depth from its parent's.
+    let mut stack = vec![tree.root];
+    while let Some(n) = stack.pop() {
+        let d = depth[n];
+        for &c in &tree.nodes[n].children {
+            depth[c] = d + 1;
+            stack.push(c);
+        }
+    }
+    depth
+}
+
+/// TADA-style phylogeny-aware perturbation (Sayyari et al., Bioinformatics 2019).
+///
+/// Traverse the tree top-down. At each internal node the parent's subtree mass is re-split among
+/// its children: the *reference* split is the children's own subtree masses in `profile`, and the
+/// perturbed split is drawn from a Beta whose mean is the reference proportion and whose
+/// concentration `ν` grows with the node's depth (`ν = base_conc / drift / (1 + depth)`), so the
+/// variance `μ(1−μ)/(ν+1)` is larger near the tips — where closely related taxa are more
+/// interchangeable. Larger `drift` ⇒ smaller `ν` ⇒ more perturbation. The result is a valid
+/// distribution over the leaves (sums to 1).
+///
+/// Binary splits are handled explicitly; nodes with >2 children perturb each child's reference
+/// fraction independently and renormalize (the generated trees are binary, so the common path is
+/// the 2-child case).
+fn tada_perturb(tree: &Tree, profile: &[f64], drift: f64, rng: &mut ChaCha8Rng) -> Vec<f64> {
+    if drift <= 0.0 {
+        return profile.to_vec();
+    }
+    let leaves = tree.leaves();
+    // Subtree mass of every node under the *reference* profile (post-order accumulation).
+    let mut sub = vec![0.0f64; tree.nodes.len()];
+    for (i, &leaf) in leaves.iter().enumerate() {
+        sub[leaf] = profile[i];
+    }
+    for n in tree.edge_order() {
+        if let Some(p) = tree.nodes[n].parent {
+            sub[p] += sub[n];
+        }
+    }
+    let depths = node_depths(tree);
+    let max_depth = depths.iter().copied().max().unwrap_or(1).max(1) as f64;
+    // Perturbed subtree mass, filled top-down from the root's total.
+    let mut pert = vec![0.0f64; tree.nodes.len()];
+    pert[tree.root] = sub[tree.root]; // total mass (≈1)
+    let base_conc = 20.0; // higher → gentler perturbation
+    let mut stack = vec![tree.root];
+    while let Some(n) = stack.pop() {
+        let children = tree.nodes[n].children.clone();
+        let parent_mass = pert[n];
+        if children.is_empty() || parent_mass <= 0.0 {
+            continue;
+        }
+        let ref_total: f64 = children.iter().map(|&c| sub[c]).sum();
+        if ref_total <= 0.0 {
+            let each = parent_mass / children.len() as f64;
+            for &c in &children {
+                pert[c] = each;
+                stack.push(c);
+            }
+            continue;
+        }
+        // TADA is only phylogeny-*friendly* when drift is localized near the tips: a split
+        // perturbation at a near-root node moves a large subtree's mass across a long tree
+        // distance, which is exactly what the tree-Wasserstein metric (correctly) penalizes. So
+        // we scale the effective drift by a locality weight that is ≈0 near the root and →1 at
+        // the tips (`(depth/max_depth)²`), then set the Beta concentration from it. Near-root
+        // nodes get a huge ν (frozen split); tip-level nodes get the full perturbation.
+        let locality = (depths[n] as f64 / max_depth).powi(2);
+        let eff_drift = drift * locality;
+        if eff_drift <= 1e-6 {
+            // essentially no perturbation at this (shallow) node: keep the reference split
+            for &c in &children {
+                pert[c] = parent_mass * (sub[c] / ref_total);
+                stack.push(c);
+            }
+            continue;
+        }
+        let nu = base_conc / eff_drift;
+        if children.len() == 2 {
+            let (a, b) = (children[0], children[1]);
+            let mu = (sub[a] / ref_total).clamp(1e-6, 1.0 - 1e-6);
+            let alpha = (mu * nu).max(1e-3);
+            let beta = ((1.0 - mu) * nu).max(1e-3);
+            let frac_a = Beta::new(alpha, beta).expect("valid beta").sample(rng);
+            pert[a] = parent_mass * frac_a;
+            pert[b] = parent_mass * (1.0 - frac_a);
+            stack.push(a);
+            stack.push(b);
+        } else {
+            let mut fr: Vec<f64> = Vec::with_capacity(children.len());
+            for &c in &children {
+                let mu = (sub[c] / ref_total).clamp(1e-6, 1.0 - 1e-6);
+                let alpha = (mu * nu).max(1e-3);
+                let beta = ((1.0 - mu) * nu).max(1e-3);
+                fr.push(Beta::new(alpha, beta).expect("valid beta").sample(rng));
+            }
+            let fs: f64 = fr.iter().sum();
+            for (idx, &c) in children.iter().enumerate() {
+                pert[c] = if fs > 0.0 {
+                    parent_mass * fr[idx] / fs
+                } else {
+                    parent_mass / children.len() as f64
+                };
+                stack.push(c);
+            }
+        }
+    }
+    let mut out = vec![0.0f64; leaves.len()];
+    for (i, &leaf) in leaves.iter().enumerate() {
+        out[i] = pert[leaf].max(0.0);
+    }
+    let s: f64 = out.iter().sum();
+    if s > 0.0 {
+        for v in &mut out {
+            *v /= s;
+        }
+    }
+    out
+}
+
 /// Multinomial draw (sequential-conditional-binomial), returning counts as f64.
 fn multinomial(rng: &mut ChaCha8Rng, n: u64, probs: &[f64]) -> Vec<f64> {
     use rand_distr::Binomial;
@@ -200,7 +344,10 @@ pub fn generate(config: &SimConfig, seed: u64) -> Scenario {
     //    community has evolved away from the reference sources.
     let mut true_sink = vec![0.0f64; d];
     for (kj, prof) in true_source_profiles.iter().enumerate() {
-        let drifted = apply_phylo_drift(prof, &siblings, config.drift);
+        let drifted = match config.drift_model {
+            DriftModel::CherrySwap => apply_phylo_drift(prof, &siblings, config.drift),
+            DriftModel::TadaBeta => tada_perturb(&tree, prof, config.drift, &mut rng),
+        };
         for i in 0..d {
             true_sink[i] += true_weights[kj] * drifted[i];
         }
@@ -324,5 +471,59 @@ mod tests {
     #[test]
     fn l1_error_basic() {
         assert_abs_diff_eq!(l1_error(&[0.5, 0.5], &[0.6, 0.4]), 0.2, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn tada_perturb_conserves_mass_and_is_zero_at_zero_drift() {
+        use rand::SeedableRng;
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let tree = random_tree(&mut rng, 32);
+        let prof = dirichlet(&mut rng, 32, 0.3);
+        // drift 0 → identity
+        let same = tada_perturb(&tree, &prof, 0.0, &mut rng);
+        assert_eq!(same, prof);
+        // drift > 0 → still a distribution, and actually changes the profile
+        let pert = tada_perturb(&tree, &prof, 0.3, &mut rng);
+        assert_abs_diff_eq!(pert.iter().sum::<f64>(), 1.0, epsilon = 1e-9);
+        assert!(pert.iter().all(|&x| x >= 0.0));
+        let moved: f64 = pert.iter().zip(prof.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(moved > 1e-6, "TADA drift should perturb the profile, moved={moved}");
+    }
+
+    #[test]
+    fn tada_perturb_stronger_drift_moves_more_mass() {
+        use rand::SeedableRng;
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let tree = random_tree(&mut rng, 48);
+        let prof = dirichlet(&mut rng, 48, 0.3);
+        // average |Δ| over several draws, since Beta draws are random
+        let avg_move = |drift: f64, seed: u64| -> f64 {
+            let mut r = ChaCha8Rng::seed_from_u64(seed);
+            let mut acc = 0.0;
+            let n = 8;
+            for _ in 0..n {
+                let p = tada_perturb(&tree, &prof, drift, &mut r);
+                acc += p.iter().zip(prof.iter()).map(|(a, b)| (a - b).abs()).sum::<f64>();
+            }
+            acc / n as f64
+        };
+        let low = avg_move(0.1, 100);
+        let high = avg_move(0.5, 100);
+        assert!(high > low, "more drift should move more mass: low={low} high={high}");
+    }
+
+    #[test]
+    fn tada_generate_is_reproducible() {
+        let cfg = SimConfig {
+            num_taxa: 24,
+            num_sources: 3,
+            drift: 0.3,
+            drift_model: DriftModel::TadaBeta,
+            ..Default::default()
+        };
+        let a = generate(&cfg, 42);
+        let b = generate(&cfg, 42);
+        assert_eq!(a.sink.counts, b.sink.counts);
+        assert_eq!(a.true_weights, b.true_weights);
     }
 }

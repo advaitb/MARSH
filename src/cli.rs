@@ -5,7 +5,6 @@ use crate::estimate::point_estimate;
 use crate::io::{align_sink, align_sources, CountTable, OnMissing};
 use crate::lp::GoodLpSolver;
 use crate::tree::Tree;
-use crate::unknown::UnknownMode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -25,7 +24,6 @@ pub enum Command {
 }
 
 #[derive(clap::Args, Debug)]
-#[command(group(clap::ArgGroup::new("tree_source").required(true).multiple(false)))]
 pub struct EstimateArgs {
     /// Source count table (TSV): rows = taxa, columns = source samples.
     #[arg(long)]
@@ -33,38 +31,24 @@ pub struct EstimateArgs {
     /// Sink count table (TSV): a single sample column, same taxa rows.
     #[arg(long)]
     pub sink: PathBuf,
-    /// Newick tree over the taxa. Exactly one tree source is required: --tree,
-    /// --star-tree, or --taxonomy.
-    #[arg(long, group = "tree_source")]
+    /// Newick tree over the taxa. When given, OTST fits under the phylogeny-aware
+    /// tree-Wasserstein loss (drift-robust). When OMITTED, there is no phylogeny to exploit and
+    /// OTST fits under a plain L2 loss over taxa — use this for tree-less OTU tables.
+    #[arg(long)]
     pub tree: Option<PathBuf>,
-    /// Build a flat STAR tree over the observed taxa instead of using a phylogeny. Reduces the
-    /// tree-Wasserstein loss to plain L1 deconvolution — phylogenetic drift-robustness is OFF.
-    /// Use when no tree is available; taxon IDs need only be unique strings.
-    #[arg(long, group = "tree_source")]
-    pub star_tree: bool,
-    /// Build an approximate tree from a taxonomy file (TSV: taxon<TAB>lineage, lineage is a
-    /// ';'-delimited rank string). Gives partial phylogenetic structure without a real tree.
-    #[arg(long, group = "tree_source", value_name = "FILE")]
-    pub taxonomy: Option<PathBuf>,
-    /// Build a data-driven tree by clustering taxa on their co-abundance across the source and
-    /// sink samples (UPGMA on correlation distance). Recovers real ground-metric structure when
-    /// no phylogeny is available — strictly better than --star-tree for the OT loss.
-    #[arg(long, group = "tree_source")]
-    pub cluster_tree: bool,
-    /// Unknown-source model.
-    #[arg(long, value_enum, default_value_t = UnknownArg::Metacommunity)]
-    pub unknown: UnknownArg,
-    /// Penalty λ for unbalanced OT (v2 only).
-    #[arg(long, default_value_t = 1.0)]
-    pub lambda: f64,
-    /// Reweighted-ℓ1 source-selection strength (only used with `--unknown estimated`). 0 = off.
-    /// Larger values suppress weakly-supported sources — useful with many candidate sources.
+    /// Estimate an unknown (unobserved) source jointly with the mixing weights. Off by default
+    /// (the named sources must explain all sink mass). Turn this on when a substantial fraction
+    /// of the sink may come from sources not in the reference set.
+    #[arg(long, default_value_t = false)]
+    pub unknown: bool,
+    /// Reweighted-ℓ1 source-selection strength (only used with `--unknown`). 0 = off. Larger
+    /// values suppress weakly-supported sources — useful with many candidate sources.
     #[arg(long, default_value_t = 0.0)]
     pub sparsity: f64,
     /// Print per-iteration convergence of the alternating unknown estimator to stderr.
     #[arg(long, default_value_t = false)]
     pub verbose: bool,
-    /// How to handle table taxa that are not tree leaves.
+    /// How to handle table taxa that are not tree leaves (only relevant with `--tree`).
     #[arg(long, value_enum, default_value_t = OnMissingArg::Error)]
     pub on_missing: OnMissingArg,
     /// Number of bootstrap replicates B for uncertainty; 0 disables it.
@@ -82,28 +66,6 @@ pub struct EstimateArgs {
     /// Output JSON path (default: stdout).
     #[arg(long)]
     pub out: Option<PathBuf>,
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug)]
-pub enum UnknownArg {
-    None,
-    Uniform,
-    Metacommunity,
-    Unbalanced,
-    /// Jointly estimate the unknown source's profile via the alternating unmixer (M5).
-    Estimated,
-}
-
-impl From<UnknownArg> for UnknownMode {
-    fn from(a: UnknownArg) -> Self {
-        match a {
-            UnknownArg::None => UnknownMode::None,
-            UnknownArg::Uniform => UnknownMode::Uniform,
-            UnknownArg::Metacommunity => UnknownMode::Metacommunity,
-            UnknownArg::Unbalanced => UnknownMode::Unbalanced,
-            UnknownArg::Estimated => UnknownMode::Estimated,
-        }
-    }
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -172,8 +134,11 @@ struct Metadata {
     num_edges: usize,
     sink_depth: f64,
     source_depths: Vec<f64>,
-    unknown_mode: String,
-    /// Tree source: "newick", "star", or "taxonomy".
+    /// Whether an unknown source was jointly estimated (`--unknown`).
+    unknown: bool,
+    /// Fitting loss: "tree-wasserstein" (with `--tree`) or "l2" (tree-less).
+    loss: String,
+    /// Tree source: "newick" or "none (L2)".
     phylogeny: String,
     solver: String,
     dropped_taxa: Vec<String>,
@@ -217,111 +182,37 @@ fn observed_taxa(src: &CountTable, sink: &CountTable) -> Vec<String> {
     taxa
 }
 
-/// Resolve the tree from exactly one of --tree / --star-tree / --taxonomy. Returns the tree, a
-/// short phylogeny-type label for the output metadata, and any user-facing warnings.
-fn build_tree(
+/// Resolve the tree. With `--tree` we parse the Newick phylogeny and fit under the
+/// tree-Wasserstein loss. Without it, we build a flat star tree purely as an alignment scaffold
+/// (a star makes tree-Wasserstein equal to plain L1, and the estimator uses an L2 weight step in
+/// this case) — this is the tree-less path for raw OTU tables. Returns the tree, whether a real
+/// phylogeny was supplied, a metadata label, and any warnings.
+fn resolve_tree(
     args: &EstimateArgs,
     src: &CountTable,
     sink: &CountTable,
-) -> Result<(Tree, String, Vec<String>)> {
+) -> Result<(Tree, bool, String, Vec<String>)> {
     let mut warnings = Vec::new();
-
     if let Some(path) = &args.tree {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading tree {}", path.display()))?;
         let tree = Tree::parse_newick(&text)
             .with_context(|| format!("parsing Newick tree {}", path.display()))?;
-        Ok((tree, "newick".to_string(), warnings))
-    } else if args.star_tree {
-        let taxa = observed_taxa(src, sink);
-        let tree = Tree::build_star(&taxa).context("building star tree")?;
-        warnings.push(
-            "star tree in use: the tree-Wasserstein loss reduces to L1 deconvolution; \
-             phylogenetic drift-robustness is DISABLED."
-                .to_string(),
-        );
-        Ok((tree, "star".to_string(), warnings))
-    } else if let Some(path) = &args.taxonomy {
-        let (taxa, lineages) = read_taxonomy(path)?;
-        let tree = Tree::build_from_taxonomy(&taxa, &lineages)
-            .with_context(|| format!("building tree from taxonomy {}", path.display()))?;
-        warnings.push(
-            "approximate taxonomy tree in use: ground metric = number of differing ranks, \
-             not true branch lengths."
-                .to_string(),
-        );
-        Ok((tree, "taxonomy".to_string(), warnings))
-    } else if args.cluster_tree {
-        let (taxa, samples) = coabundance_matrix(src, sink);
-        let tree = crate::cluster::build_cluster_tree(
-            &taxa,
-            &samples,
-            crate::cluster::TaxonDistance::Correlation,
-        )
-        .context("building co-abundance cluster tree")?;
-        warnings.push(
-            "data-driven cluster tree in use: ground metric = taxon co-abundance distance, \
-             a heuristic surrogate for phylogeny (co-abundance is not evolutionary relatedness)."
-                .to_string(),
-        );
-        Ok((tree, "cluster".to_string(), warnings))
+        Ok((tree, true, "newick".to_string(), warnings))
     } else {
-        // Unreachable: the clap ArgGroup marks a tree source as required.
-        anyhow::bail!("no tree source provided (use --tree, --star-tree, --taxonomy, or --cluster-tree)")
+        let taxa = observed_taxa(src, sink);
+        let tree = Tree::build_star(&taxa).context("building star scaffold")?;
+        warnings.push(
+            "no --tree given: fitting under a plain L2 loss over taxa (no phylogeny to exploit). \
+             Provide --tree for the drift-robust tree-Wasserstein loss."
+                .to_string(),
+        );
+        Ok((tree, false, "none (L2)".to_string(), warnings))
     }
-}
-
-/// Assemble a per-sample abundance matrix over the union of observed taxa: returns the taxa
-/// (leaf names) and, for each sample column across BOTH tables, a length-|taxa| abundance
-/// vector. Used to cluster taxa by co-abundance for `--cluster-tree`.
-fn coabundance_matrix(src: &CountTable, sink: &CountTable) -> (Vec<String>, Vec<Vec<f64>>) {
-    let taxa = observed_taxa(src, sink);
-    let index: std::collections::HashMap<&str, usize> =
-        taxa.iter().enumerate().map(|(i, t)| (t.as_str(), i)).collect();
-    let d = taxa.len();
-
-    let mut samples: Vec<Vec<f64>> = Vec::new();
-    for table in [src, sink] {
-        for col in 0..table.num_samples() {
-            let mut v = vec![0.0f64; d];
-            for (row, taxon) in table.taxa.iter().enumerate() {
-                if let Some(&ti) = index.get(taxon.as_str()) {
-                    v[ti] += table.values[row][col];
-                }
-            }
-            samples.push(v);
-        }
-    }
-    (taxa, samples)
-}
-
-/// Read a taxonomy TSV: `taxon<TAB>lineage` per line, lineage is a ';'-delimited rank string.
-fn read_taxonomy(path: &std::path::Path) -> Result<(Vec<String>, Vec<String>)> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading taxonomy {}", path.display()))?;
-    let mut taxa = Vec::new();
-    let mut lineages = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.splitn(2, '\t');
-        let taxon = parts.next().unwrap_or("").trim().to_string();
-        let lineage = parts.next().unwrap_or("").trim().to_string();
-        if taxon.is_empty() {
-            anyhow::bail!("taxonomy {}: empty taxon id on line {}", path.display(), i + 1);
-        }
-        taxa.push(taxon);
-        lineages.push(lineage);
-    }
-    if taxa.is_empty() {
-        anyhow::bail!("taxonomy {} has no entries", path.display());
-    }
-    Ok((taxa, lineages))
 }
 
 fn run_estimate(args: EstimateArgs) -> Result<()> {
-    // Tables first — star/taxonomy tree builders need the observed taxa.
+    // Tables first — the tree-less scaffold needs the observed taxa.
     let src_path = args.sources.display().to_string();
     let sink_path = args.sink.display().to_string();
     let src_table = CountTable::from_tsv_path(&args.sources)
@@ -329,14 +220,13 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
     let sink_table = CountTable::from_tsv_path(&args.sink)
         .with_context(|| format!("reading sink {sink_path}"))?;
 
-    // Resolve the tree from exactly one source (enforced by the clap ArgGroup).
-    let (tree, phylogeny, mut warnings) = build_tree(&args, &src_table, &sink_table)?;
+    // Resolve the tree: real phylogeny (--tree) => tree-Wasserstein loss; absent => star
+    // scaffold + L2 loss.
+    let (tree, has_tree, phylogeny, mut warnings) = resolve_tree(&args, &src_table, &sink_table)?;
 
     let on_missing: OnMissing = args.on_missing.into();
     let (sources, src_report) = align_sources(&src_table, &tree, on_missing, &src_path)?;
     let (sink, sink_report) = align_sink(&sink_table, &tree, on_missing, &sink_path)?;
-
-    let mode: UnknownMode = args.unknown.into();
 
     // Configure the rayon thread pool if the user requested a specific count.
     if args.threads != 0 {
@@ -348,23 +238,17 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
 
     let start = std::time::Instant::now();
 
-    // `Estimated` mode does not support the bootstrap (see below); every other mode does.
-    let effective_bootstrap = if let UnknownMode::Estimated = mode {
-        0
-    } else {
-        args.bootstrap
-    };
+    // The two axes are independent: `--unknown` toggles joint unknown-profile estimation; the
+    // presence of `--tree` chooses the loss (tree-Wasserstein vs L2). The unknown estimator does
+    // not support the bootstrap (see below).
+    let effective_bootstrap = if args.unknown { 0 } else { args.bootstrap };
     let mut unmix_iters: Option<usize> = None;
 
-    // Point estimate. `Estimated` mode jointly estimates the unknown *profile* via the
-    // alternating unmixer (M5); every other mode is the single convex LP solve. In both cases we
-    // end with a `Prepared` carrying the (fixed, for this run) background so the bootstrap can
-    // re-solve per replicate.
-    let (est, prepared) = if let UnknownMode::Estimated = mode {
-        // On a real phylogeny the tree-Wasserstein weight step carries the drift-robustness; on
-        // a star/cluster/taxonomy surrogate the ground metric has little signal and an L2 weight
-        // step fits compositional read data markedly better (best-in-class on tree-less data).
-        let weight_step = if phylogeny == "newick" {
+    let (est, prepared) = if args.unknown {
+        // Joint unknown-profile estimation (alternating loop). Use the tree-Wasserstein weight
+        // step when a real phylogeny is available (drift-robust); otherwise L2, which fits
+        // compositional read data better on tree-less data (best-in-class there).
+        let weight_step = if has_tree {
             crate::unmix::WeightStep::TreeWasserstein
         } else {
             crate::unmix::WeightStep::L2
@@ -378,20 +262,17 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         let res = crate::unmix::alternating_estimate(&GoodLpSolver, &tree, &sources, &sink, &cfg)
             .context("running the alternating unknown-profile estimator")?;
         unmix_iters = Some(res.iters);
-        // The alternating estimator's uncertainty is not yet wired: the point estimate uses the
-        // (possibly L2) alternating loop, so re-solving replicates through the LP with a frozen
-        // profile would be inconsistent — and at seconds-per-solve on large tables a full
-        // bootstrap is impractical anyway. Disable it here and say so, rather than emit
-        // intervals that don't match the point estimate.
+        // The alternating estimator's uncertainty is not yet wired: re-solving replicates with a
+        // frozen profile would be inconsistent with the point estimate (and impractically slow on
+        // large tables). Disable the bootstrap and say so, rather than emit mismatched intervals.
         if args.bootstrap > 0 {
             warnings.push(
-                "bootstrap intervals are not available with --unknown estimated (M5); \
-                 reporting the point estimate only."
+                "bootstrap intervals are not available with --unknown; reporting the point \
+                 estimate only."
                     .to_string(),
             );
         }
-        // Freeze the estimated unknown profile as the background so the (skipped) bootstrap and
-        // the metadata line up with the reported estimate.
+        // Freeze the estimated unknown profile so the metadata lines up with the reported estimate.
         let prepared = crate::estimate::Prepared::with_background(
             &tree,
             &sources,
@@ -399,8 +280,8 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         );
         (res.estimate, prepared)
     } else {
-        point_estimate(&GoodLpSolver, &tree, &sources, &sink, mode, args.lambda)
-            .context("solving the tree-Wasserstein LP")?
+        point_estimate(&GoodLpSolver, &tree, &sources, &sink)
+            .context("solving the source-tracking LP")?
     };
 
     // Point weights in prepared.source_names order (named sources + optional Unknown).
@@ -425,14 +306,13 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
     let interval_by_name: std::collections::HashMap<&str, &bootstrap::SourceInterval> =
         boot.sources.iter().map(|si| (si.name.as_str(), si)).collect();
 
-    // Split named sources from the Unknown source for reporting.
+    // The Unknown source's weight is reported separately as the unknown fraction.
     let unknown_fraction: f64 = est
         .sources
         .iter()
         .filter(|s| s.name == crate::unknown::UNKNOWN_LABEL)
         .map(|s| s.proportion)
-        .sum::<f64>()
-        + est.deficit; // v2 deficit also counts as unknown
+        .sum::<f64>();
 
     let have_bootstrap = effective_bootstrap > 0;
     let sources_out: Vec<SourceOut> = est
@@ -481,7 +361,8 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
             num_edges: tree.num_edges(),
             sink_depth: sink.depth,
             source_depths: sources.profiles.iter().map(|p| p.depth).collect(),
-            unknown_mode: format!("{mode:?}"),
+            unknown: args.unknown,
+            loss: if has_tree { "tree-wasserstein" } else { "l2" }.to_string(),
             phylogeny,
             solver: "good_lp+microlp".to_string(),
             dropped_taxa: dropped,

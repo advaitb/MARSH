@@ -145,17 +145,26 @@ Keep `lp.rs` solver-agnostic behind a small trait so the LP backend can be swapp
 otst estimate \
   --sources sources.tsv \      # rows = taxa, cols = source samples (counts)
   --sink sink.tsv \            # single column of counts, same taxa rows
-  --tree tree.nwk \            # Newick over the taxa
-  --unknown metacommunity \    # {none, uniform, metacommunity} (v1) or `unbalanced` (v2)
-  --lambda 1.0 \               # penalty for unbalanced OT (v2 only)
-  --bootstrap 500 \            # B; 0 disables uncertainty
+  --tree tree.nwk \            # Newick over the taxa; OMIT for tree-less data (=> L2 loss)
+  --unknown \                  # flag: jointly estimate an unknown source (off by default)
+  --sparsity 0.0 \             # reweighted-L1 source selection (only with --unknown)
+  --bootstrap 500 \            # B; 0 disables uncertainty (auto-off with --unknown)
   --interval bca \             # {percentile, m-out-of-n, bca}
   --threads 0 \                # 0 = all cores
   --out result.json
 ```
 
+> **Design converged (post-benchmark cleanup).** The tool exposes exactly two orthogonal axes:
+> the **loss** is chosen by whether `--tree` is given (present → tree-Wasserstein / drift-robust;
+> absent → plain L2 over taxa, for tree-less OTU tables), and **`--unknown`** is a boolean that
+> toggles joint unknown-*profile* estimation (the M5 alternating loop). The earlier fixed-background
+> modes (`uniform`, `metacommunity`), the unbalanced-OT deficit (`--lambda`), and the
+> `--star-tree`/`--taxonomy`/`--cluster-tree` surrogates were removed: the benchmark showed the
+> joint estimator dominates the fixed backgrounds, and a star tree is just an L2 fit dressed up as
+> a tree. `--unknown` disables the bootstrap (its intervals are not yet wired).
+
 Output JSON: per-source `{name, proportion, ci_low, ci_high, one_sided}`, the unknown
-fraction, the objective value, and run metadata (B, depths, solver, wall-clock).
+fraction, the objective value, and run metadata (loss, unknown flag, B, depths, solver, wall-clock).
 
 Library API mirror: `otst::estimate(sources, sink, tree, config) -> SourceTrackingResult`.
 

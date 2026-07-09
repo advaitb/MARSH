@@ -178,7 +178,7 @@ pub fn alternating_estimate<S: LpSolver>(
     let mut b0 = residual_profile_init(&source_profiles, &init_w, &sink_norm);
 
     let mut prev_w: Option<Vec<f64>> = None;
-    let mut last: Option<(Vec<f64>, f64, f64)> = None; // (weights, objective, deficit)
+    let mut last: Option<(Vec<f64>, f64)> = None; // (weights, objective)
     let mut iters = 0;
 
     for _ in 0..cfg.max_iters.max(1) {
@@ -207,22 +207,22 @@ pub fn alternating_estimate<S: LpSolver>(
             Vec::new()
         };
 
-        let (w, objective, deficit) = match cfg.weight_step {
+        let (w, objective) = match cfg.weight_step {
             WeightStep::TreeWasserstein => {
                 let mut prepared = Prepared::with_background(tree, sources, b0.clone());
                 prepared.weight_penalty = penalty;
                 let sol = prepared.solve(solver, &source_profiles, &sink_norm)?;
-                (sol.weights, sol.objective, sol.deficit)
+                (sol.weights, sol.objective)
             }
             WeightStep::L2 => {
                 // Columns = named sources + the current unknown profile b_0.
                 let mut cols: Vec<Vec<f64>> = source_profiles.clone();
                 cols.push(b0.clone());
                 let w = l2_deconvolve_penalized(&cols, &sink_norm, &penalty, prev_w.as_deref());
-                // Report an L1-over-taxa distance as the objective (star-tree TW = L1); no
-                // unexplained deficit under the simplex-constrained L2 fit.
+                // Report an L1-over-taxa distance as the objective (a star tree makes the
+                // tree-Wasserstein loss equal to this L1).
                 let obj = l1_taxa_distance(&cols, &w, &sink_norm);
-                (w, obj, 0.0)
+                (w, obj)
             }
         };
 
@@ -241,13 +241,13 @@ pub fn alternating_estimate<S: LpSolver>(
             eprintln!("  [unmix] iter {iters}: unknown={unk:.4} Δw={delta:.2e}");
         }
         prev_w = Some(w.clone());
-        last = Some((w, objective, deficit));
+        last = Some((w, objective));
         if delta < cfg.tol {
             break;
         }
     }
 
-    let (weights, objective, deficit) = last.expect("at least one iteration runs");
+    let (weights, objective) = last.expect("at least one iteration runs");
     let names: Vec<String> = sources
         .names
         .iter()
@@ -267,7 +267,6 @@ pub fn alternating_estimate<S: LpSolver>(
         estimate: PointEstimate {
             sources: sources_out,
             objective,
-            deficit,
         },
         unknown_profile: b0,
         iters,

@@ -126,6 +126,37 @@ impl Tree {
         self.edge_order().map(|n| acc[n]).collect()
     }
 
+    /// Serialize the tree back to a Newick string (with branch lengths, trailing `;`). Round-trips
+    /// with [`Self::parse_newick`]. Used to export simulated trees to a `.nwk` file so the same
+    /// tree the simulator built can be handed to the CLI (`--tree`) and to competing methods.
+    pub fn to_newick(&self) -> String {
+        let mut s = String::new();
+        self.write_node(self.root, &mut s, true);
+        s.push(';');
+        s
+    }
+
+    fn write_node(&self, n: NodeId, out: &mut String, is_root: bool) {
+        let node = &self.nodes[n];
+        if !node.children.is_empty() {
+            out.push('(');
+            for (i, &c) in node.children.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                self.write_node(c, out, false);
+            }
+            out.push(')');
+        }
+        if let Some(name) = &node.name {
+            out.push_str(name);
+        }
+        if !is_root {
+            out.push(':');
+            out.push_str(&format!("{}", node.edge_length));
+        }
+    }
+
     /// Parse a Newick string into a rooted tree.
     ///
     /// Handles: named/unnamed internal nodes, quoted labels (`'A_1'`), missing branch
@@ -184,92 +215,6 @@ impl Tree {
         Tree::finalize(nodes, root)
     }
 
-    /// Build an **approximate tree from taxonomy lineage strings**.
-    ///
-    /// Each taxon maps to a semicolon-delimited lineage, e.g.
-    /// `"k__Bacteria;p__Firmicutes;c__Clostridia;...;g__Bacteroides"`. Shared prefixes become
-    /// shared internal nodes, so two taxa agreeing to genus sit closer (shorter path) than two
-    /// agreeing only to phylum. Every rank edge has unit length, so path distance = number of
-    /// differing ranks — a coarse but genuinely phylogeny-aware ground metric when no real tree
-    /// exists. Empty/blank ranks are skipped; a taxon whose lineage is entirely empty attaches
-    /// directly to the root.
-    ///
-    /// `taxa` and `lineages` are parallel arrays of equal length.
-    pub fn build_from_taxonomy(
-        taxa: &[String],
-        lineages: &[String],
-    ) -> Result<Tree, TreeError> {
-        if taxa.is_empty() {
-            return Err(TreeError::NoLeaves);
-        }
-        if taxa.len() != lineages.len() {
-            return Err(TreeError::Parse {
-                pos: 0,
-                msg: format!(
-                    "taxa ({}) and lineages ({}) length mismatch",
-                    taxa.len(),
-                    lineages.len()
-                ),
-            });
-        }
-
-        let mut nodes = vec![Node {
-            name: None,
-            edge_length: 0.0,
-            parent: None,
-            children: Vec::new(),
-        }];
-        let root = 0;
-
-        // Intern internal nodes by their cumulative lineage path so shared prefixes merge.
-        // Key: the full path string up to and including a rank.
-        let mut internal: HashMap<String, NodeId> = HashMap::new();
-
-        for (taxon, lineage) in taxa.iter().zip(lineages.iter()) {
-            // ranks: non-empty, trimmed segments
-            let ranks: Vec<&str> = lineage
-                .split(';')
-                .map(|r| r.trim())
-                .filter(|r| !r.is_empty())
-                .collect();
-
-            // Walk/create the internal chain for the ranks, then attach the taxon leaf.
-            let mut parent = root;
-            let mut path_key = String::new();
-            for rank in &ranks {
-                path_key.push_str(rank);
-                path_key.push(';');
-                let node_id = match internal.get(&path_key) {
-                    Some(&id) => id,
-                    None => {
-                        let id = nodes.len();
-                        nodes.push(Node {
-                            name: None, // internal taxonomy node, unnamed
-                            edge_length: 1.0,
-                            parent: Some(parent),
-                            children: Vec::new(),
-                        });
-                        nodes[parent].children.push(id);
-                        internal.insert(path_key.clone(), id);
-                        id
-                    }
-                };
-                parent = node_id;
-            }
-
-            // attach the taxon as a leaf under the last rank node (or root if no ranks)
-            let leaf_id = nodes.len();
-            nodes.push(Node {
-                name: Some(taxon.clone()),
-                edge_length: 1.0,
-                parent: Some(parent),
-                children: Vec::new(),
-            });
-            nodes[parent].children.push(leaf_id);
-        }
-
-        Tree::finalize(nodes, root)
-    }
 
     /// Shared construction tail: validate edge lengths, collect leaves + name index, and
     /// precompute the post-order. Used by every tree builder.
@@ -523,6 +468,23 @@ mod tests {
     }
 
     #[test]
+    fn to_newick_round_trips() {
+        // Re-parsing a serialized tree must reproduce leaf set, edge count, and cumulative masses.
+        let t = Tree::parse_newick("((A:0.1,B:0.2):0.3,(C:0.4,D:0.5):0.6);").unwrap();
+        let t2 = Tree::parse_newick(&t.to_newick()).unwrap();
+        assert_eq!(t.num_leaves(), t2.num_leaves());
+        assert_eq!(t.num_edges(), t2.num_edges());
+        // masses over the same leaf order must match (both in their own leaves() order)
+        let mass = |tr: &Tree| {
+            let d = tr.num_leaves();
+            let m: Vec<f64> = (0..d).map(|i| (i + 1) as f64).collect();
+            tr.cumulative_masses(&m)
+        };
+        // Leaf order is deterministic from structure; the serialized tree keeps child order.
+        assert_eq!(mass(&t), mass(&t2));
+    }
+
+    #[test]
     fn root_to_leaf_path_lengths() {
         let t = Tree::parse_newick("((A:0.1,B:0.2):0.3,(C:0.4,D:0.5):0.6);").unwrap();
         // path length A = 0.1 + 0.3 = 0.4 ; D = 0.5 + 0.6 = 1.1
@@ -644,62 +606,4 @@ mod tests {
         assert!(t.leaf_by_name("abc123hash").is_some());
     }
 
-    #[test]
-    fn taxonomy_tree_places_relatives_closer() {
-        // A and B share genus; C shares only phylum. Path distance A-B < A-C.
-        let taxa: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
-        let lineages = vec![
-            "k__Bac;p__Firm;g__Bacteroides".to_string(),
-            "k__Bac;p__Firm;g__Bacteroides".to_string(),
-            "k__Bac;p__Proteo;g__E".to_string(),
-        ];
-        let t = Tree::build_from_taxonomy(&taxa, &lineages).unwrap();
-        assert_eq!(t.num_leaves(), 3);
-
-        // topological path length between two leaves (sum of edge lengths on the path via LCA)
-        let depth = |name: &str| -> Vec<NodeId> {
-            let mut n = t.leaf_by_name(name).unwrap();
-            let mut path = vec![n];
-            while let Some(p) = t.nodes[n].parent {
-                path.push(p);
-                n = p;
-            }
-            path
-        };
-        let path_dist = |x: &str, y: &str| -> f64 {
-            let px = depth(x);
-            let py: std::collections::HashSet<NodeId> = depth(y).into_iter().collect();
-            // distance = (edges from x up to LCA) + (edges from y up to LCA)
-            // compute via counting: sum of edge lengths from x to LCA and y to LCA
-            // find LCA as first node in px that is in py
-            let lca = *px.iter().find(|n| py.contains(n)).unwrap();
-            let up = |leaf: &str| -> f64 {
-                let mut n = t.leaf_by_name(leaf).unwrap();
-                let mut d = 0.0;
-                while n != lca {
-                    d += t.nodes[n].edge_length;
-                    n = t.nodes[n].parent.unwrap();
-                }
-                d
-            };
-            up(x) + up(y)
-        };
-
-        let d_ab = path_dist("A", "B");
-        let d_ac = path_dist("A", "C");
-        assert!(
-            d_ab < d_ac,
-            "same-genus pair (d={d_ab}) should be closer than cross-phylum pair (d={d_ac})"
-        );
-    }
-
-    #[test]
-    fn taxonomy_empty_lineage_attaches_to_root() {
-        let taxa: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
-        let lineages = vec!["".to_string(), "k__Bac;g__X".to_string()];
-        let t = Tree::build_from_taxonomy(&taxa, &lineages).unwrap();
-        // A attaches directly to root
-        let a = t.leaf_by_name("A").unwrap();
-        assert_eq!(t.nodes[a].parent, Some(t.root));
-    }
 }

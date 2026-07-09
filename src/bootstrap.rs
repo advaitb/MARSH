@@ -272,7 +272,6 @@ mod tests {
     use crate::estimate::Prepared;
     use crate::lp::GoodLpSolver;
     use crate::tree::Tree;
-    use crate::unknown::UnknownMode;
     use approx::assert_abs_diff_eq;
 
     fn balanced_tree() -> Tree {
@@ -331,7 +330,7 @@ mod tests {
             ],
         };
         let sink = Profile::from_counts(vec![350.0, 350.0, 150.0, 150.0]);
-        let prepared = Prepared::new(&tree, &sources, UnknownMode::None, 0.0);
+        let prepared = Prepared::new(&tree, &sources);
         let src_norm: Vec<Vec<f64>> = sources.profiles.iter().map(|p| p.normalized()).collect();
         let point = prepared
             .solve(&GoodLpSolver, &src_norm, &sink.normalized())
@@ -363,7 +362,7 @@ mod tests {
         };
         // sink = 0.6 s1 + 0.4 s2 at depth 2000
         let sink = Profile::from_counts(vec![960.0, 240.0, 160.0, 640.0]);
-        let prepared = Prepared::new(&tree, &sources, UnknownMode::None, 0.0);
+        let prepared = Prepared::new(&tree, &sources);
         let src_norm: Vec<Vec<f64>> = sources.profiles.iter().map(|p| p.normalized()).collect();
         let point = prepared
             .solve(&GoodLpSolver, &src_norm, &sink.normalized())
