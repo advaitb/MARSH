@@ -126,6 +126,30 @@ impl Tree {
         self.edge_order().map(|n| acc[n]).collect()
     }
 
+    /// For each edge (in [`Self::edge_order`]), the list of leaf indices (in [`Self::leaves`]
+    /// order) that sit in the subtree below that edge. This is the sparse incidence used by the
+    /// tree-Wasserstein-consistent profile step: the cumulative mass on edge `e` of a leaf
+    /// distribution `b` is `Σ_{j ∈ result[e]} b_j`, a linear function whose coefficients are all
+    /// 1. Built by walking each leaf up to the root — O(D · average depth), far cheaper than a
+    /// dense E×D matrix.
+    pub fn edge_leaf_descendants(&self) -> Vec<Vec<usize>> {
+        // node id -> its position in edge_order (i.e. its edge index). The root has no edge.
+        let mut edge_index = vec![usize::MAX; self.nodes.len()];
+        for (ei, n) in self.edge_order().enumerate() {
+            edge_index[n] = ei;
+        }
+        let mut out = vec![Vec::new(); self.num_edges()];
+        for (li, &leaf) in self.leaves.iter().enumerate() {
+            let mut node = leaf;
+            // Walk to the root, recording this leaf under every edge on the path.
+            while node != self.root {
+                out[edge_index[node]].push(li);
+                node = self.nodes[node].parent.expect("non-root has a parent");
+            }
+        }
+        out
+    }
+
     /// Serialize the tree back to a Newick string (with branch lengths, trailing `;`). Round-trips
     /// with [`Self::parse_newick`]. Used to export simulated trees to a `.nwk` file so the same
     /// tree the simulator built can be handed to the CLI (`--tree`) and to competing methods.
@@ -569,6 +593,21 @@ mod tests {
         // one edge (A above root), cumulative mass 1.0
         assert_eq!(s.len(), t.num_edges());
         assert_abs_diff_eq!(s[0], 1.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn edge_leaf_descendants_matches_cumulative_masses() {
+        // The incidence must reproduce cumulative_masses: for any leaf distribution b,
+        // s_e = Σ_{j ∈ descendants(e)} b_j.
+        let t = Tree::parse_newick("((A:1,B:1):1,(C:1,D:2):1,E:3);").unwrap();
+        let desc = t.edge_leaf_descendants();
+        assert_eq!(desc.len(), t.num_edges());
+        let b = vec![0.1, 0.2, 0.3, 0.15, 0.25];
+        let cum = t.cumulative_masses(&b);
+        for (ei, leaves) in desc.iter().enumerate() {
+            let via_incidence: f64 = leaves.iter().map(|&j| b[j]).sum();
+            assert_abs_diff_eq!(via_incidence, cum[ei], epsilon = 1e-12);
+        }
     }
 
     #[test]

@@ -29,6 +29,22 @@ pub enum DriftModel {
     TadaBeta,
 }
 
+/// How source/unknown community profiles are generated over the taxa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileModel {
+    /// iid Dirichlet over leaves — profiles carry **no phylogenetic structure** (each taxon is
+    /// independent of its neighbours). This is exactly the generative assumption of NMF/GLS methods
+    /// (independent multinomial columns), so a tree-aware loss has no structural advantage to
+    /// exploit; the only signal it can use is drift. Kept as the neutral baseline.
+    IidDirichlet,
+    /// Dirichlet-tree process (Wang & Zhao, Ann. Appl. Stat. 2017): mass is split top-down at each
+    /// internal node by a Beta/Dirichlet draw, so sibling subtrees get correlated mass and the
+    /// resulting profile is **phylogenetically autocorrelated** — closely related taxa co-occur, as
+    /// in real microbial communities. This is the biologically faithful model; it gives the tree a
+    /// real signal to exploit (independent of drift).
+    DirichletTree,
+}
+
 /// Parameters for one simulated scenario.
 #[derive(Debug, Clone)]
 pub struct SimConfig {
@@ -45,6 +61,8 @@ pub struct SimConfig {
     pub drift: f64,
     /// Which drift model moves sink mass away from the reference sources.
     pub drift_model: DriftModel,
+    /// How source/unknown profiles are generated (iid vs phylogenetically structured).
+    pub profile_model: ProfileModel,
     /// Sink sequencing depth n.
     pub sink_depth: u64,
     /// Source sequencing depth m (per source).
@@ -60,6 +78,7 @@ impl Default for SimConfig {
             unknown_fraction: 0.0,
             drift: 0.0,
             drift_model: DriftModel::CherrySwap,
+            profile_model: ProfileModel::IidDirichlet,
             sink_depth: 10_000,
             source_depth: 10_000,
         }
@@ -79,6 +98,10 @@ pub struct Scenario {
     pub true_unknown: f64,
     /// The *true* (noise-free) sink composition before sequencing, length D.
     pub true_sink_composition: Vec<f64>,
+    /// The true (noise-free) hidden unknown-source profile, length D (sums to 1). Exposed so an
+    /// oracle diagnostic can fix `b_0` to the truth and isolate the weight step from the
+    /// profile-estimation step.
+    pub unknown_profile: Vec<f64>,
 }
 
 /// Generate a random rooted binary tree over `num_taxa` leaves by repeatedly joining random
@@ -104,6 +127,43 @@ fn dirichlet(rng: &mut ChaCha8Rng, d: usize, alpha: f64) -> Vec<f64> {
     let raw: Vec<f64> = (0..d).map(|_| gamma.sample(rng).max(1e-12)).collect();
     let sum: f64 = raw.iter().sum();
     raw.into_iter().map(|x| x / sum).collect()
+}
+
+/// Draw a phylogenetically-structured community profile via a **Dirichlet-tree** process
+/// (Wang & Zhao, Ann. Appl. Stat. 2017). Starting from unit mass at the root, at every internal
+/// node the parent's mass is divided among its children by a symmetric Dirichlet(`conc`) draw; a
+/// leaf's mass is what reaches it. Because a whole subtree shares the split decisions above it,
+/// sibling taxa get correlated mass — the profile is autocorrelated along the tree, as real
+/// communities are. Smaller `conc` ⇒ more skewed splits ⇒ patchier (more realistic) profiles.
+fn dirichlet_tree(rng: &mut ChaCha8Rng, tree: &Tree, conc: f64) -> Vec<f64> {
+    let gamma = Gamma::new(conc, 1.0).expect("conc > 0");
+    let mut mass = vec![0.0f64; tree.nodes.len()];
+    mass[tree.root] = 1.0;
+    // Top-down: split each node's mass among its children by a symmetric Dirichlet draw.
+    let mut stack = vec![tree.root];
+    while let Some(n) = stack.pop() {
+        let children = &tree.nodes[n].children;
+        if children.is_empty() {
+            continue;
+        }
+        let raw: Vec<f64> = children.iter().map(|_| gamma.sample(rng).max(1e-12)).collect();
+        let sum: f64 = raw.iter().sum();
+        let parent_mass = mass[n];
+        for (c_idx, &c) in children.iter().enumerate() {
+            mass[c] = parent_mass * raw[c_idx] / sum;
+            stack.push(c);
+        }
+    }
+    // Read out leaf masses in leaf order.
+    let leaves = tree.leaves();
+    let mut out: Vec<f64> = leaves.iter().map(|&l| mass[l]).collect();
+    let s: f64 = out.iter().sum();
+    if s > 0.0 {
+        for v in &mut out {
+            *v /= s;
+        }
+    }
+    out
 }
 
 /// For each leaf, its sibling leaf (a leaf sharing the same parent), if any — the target of
@@ -325,12 +385,15 @@ pub fn generate(config: &SimConfig, seed: u64) -> Scenario {
     let siblings = leaf_siblings(&tree);
     // Leaves are in tree leaf order; source/sink vectors use that same order.
 
-    // 2) true source profiles (Dirichlet), sampled to counts at source_depth
-    let true_source_profiles: Vec<Vec<f64>> =
-        (0..k).map(|_| dirichlet(&mut rng, d, config.dirichlet_alpha)).collect();
-
-    // 3) hidden unknown source profile (also Dirichlet, independent)
-    let unknown_profile = dirichlet(&mut rng, d, config.dirichlet_alpha);
+    // 2) + 3) true source profiles and the hidden unknown profile. Under IidDirichlet these are
+    //    iid over leaves (no tree structure); under DirichletTree they are phylogenetically
+    //    autocorrelated (the biologically faithful model that gives the tree a real signal).
+    let draw_profile = |rng: &mut ChaCha8Rng| match config.profile_model {
+        ProfileModel::IidDirichlet => dirichlet(rng, d, config.dirichlet_alpha),
+        ProfileModel::DirichletTree => dirichlet_tree(rng, &tree, config.dirichlet_alpha),
+    };
+    let true_source_profiles: Vec<Vec<f64>> = (0..k).map(|_| draw_profile(&mut rng)).collect();
+    let unknown_profile = draw_profile(&mut rng);
 
     // 4) ground-truth weights over K named sources (Dirichlet on the simplex), scaled to
     //    (1 − unknown_fraction).
@@ -380,6 +443,7 @@ pub fn generate(config: &SimConfig, seed: u64) -> Scenario {
         true_weights,
         true_unknown: config.unknown_fraction,
         true_sink_composition: true_sink,
+        unknown_profile,
     }
 }
 
@@ -510,6 +574,65 @@ mod tests {
         let low = avg_move(0.1, 100);
         let high = avg_move(0.5, 100);
         assert!(high > low, "more drift should move more mass: low={low} high={high}");
+    }
+
+    #[test]
+    fn dirichlet_tree_is_phylogenetically_autocorrelated() {
+        // A Dirichlet-tree profile should make sibling leaves more similar in mass than random
+        // (non-sibling) leaf pairs — that correlation is the whole point of the model. iid
+        // Dirichlet has no such structure, so it serves as the null.
+        use rand::SeedableRng;
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        let tree = random_tree(&mut rng, 128);
+        let sib = leaf_siblings(&tree);
+
+        // Average over several draws to beat per-draw noise.
+        let mut tree_sib = 0.0;
+        let mut tree_rand = 0.0;
+        let mut iid_sib = 0.0;
+        let mut iid_rand = 0.0;
+        let n_draws = 20;
+        for _ in 0..n_draws {
+            let pt = dirichlet_tree(&mut rng, &tree, 0.3);
+            let pi = dirichlet(&mut rng, 128, 0.3);
+            // sibling pair |Δmass| vs a fixed "random" pair (leaf i and leaf i+1 in leaf order,
+            // which are generally NOT tree siblings).
+            let mut ts = (0.0, 0usize);
+            for (i, s) in sib.iter().enumerate() {
+                if let Some(j) = s {
+                    ts.0 += (pt[i] - pt[*j]).abs();
+                    iid_sib += (pi[i] - pi[*j]).abs();
+                    ts.1 += 1;
+                }
+            }
+            tree_sib += ts.0;
+            // random pairs: consecutive leaf indices
+            for i in 0..127 {
+                tree_rand += (pt[i] - pt[i + 1]).abs();
+                iid_rand += (pi[i] - pi[i + 1]).abs();
+            }
+        }
+        // Normalize is unnecessary for the inequality direction; compare ratios instead.
+        // For the Dirichlet-tree, sibling differences should be a smaller fraction of random-pair
+        // differences than for iid (where the two are statistically identical).
+        let tree_ratio = tree_sib / tree_rand;
+        let iid_ratio = iid_sib / iid_rand;
+        assert!(
+            tree_ratio < iid_ratio,
+            "Dirichlet-tree siblings should be relatively more similar than iid: \
+             tree_ratio={tree_ratio:.3} iid_ratio={iid_ratio:.3}"
+        );
+    }
+
+    #[test]
+    fn dirichlet_tree_sums_to_one() {
+        use rand::SeedableRng;
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        let tree = random_tree(&mut rng, 64);
+        let p = dirichlet_tree(&mut rng, &tree, 0.5);
+        assert_eq!(p.len(), 64);
+        assert_abs_diff_eq!(p.iter().sum::<f64>(), 1.0, epsilon = 1e-9);
+        assert!(p.iter().all(|&x| x >= 0.0));
     }
 
     #[test]

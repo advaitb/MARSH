@@ -18,7 +18,7 @@
 //! `tada` (whole-tree Beta-split perturbation). Example:
 //!   export_sim benchmark/data/phylo 30 0.3
 
-use otst::sim::{generate, DriftModel, SimConfig};
+use otst::sim::{generate, DriftModel, ProfileModel, SimConfig};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -46,6 +46,12 @@ fn main() {
         Some("tada") => DriftModel::TadaBeta,
         _ => DriftModel::CherrySwap,
     };
+    // Arg 9: profile model. `tree` = phylogenetically-structured (Dirichlet-tree, the biologically
+    // faithful model); anything else = iid Dirichlet (no tree structure, the neutral baseline).
+    let profile_model = match args.get(9).map(|s| s.as_str()) {
+        Some("tree") => ProfileModel::DirichletTree,
+        _ => ProfileModel::IidDirichlet,
+    };
 
     let cfg = SimConfig {
         num_taxa,
@@ -54,6 +60,7 @@ fn main() {
         unknown_fraction,
         drift,
         drift_model,
+        profile_model,
         sink_depth: 20_000,
         source_depth: 20_000,
     };
@@ -87,7 +94,7 @@ fn main() {
     )
     .unwrap();
     eprintln!(
-        "wrote {n_reps} replicates to {out_dir} (drift={drift}, taxa={num_taxa}, K={num_sources}, unknown={unknown_fraction})"
+        "wrote {n_reps} replicates to {out_dir} (drift={drift}, taxa={num_taxa}, K={num_sources}, unknown={unknown_fraction}, profiles={profile_model:?})"
     );
 }
 

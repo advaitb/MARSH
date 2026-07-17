@@ -1,5 +1,2 @@
 /target
-/benchmark/upstream
-/benchmark/data/grid_tmp
-/benchmark/data/phylo_sweep
-/benchmark/run_rust_baselines
+/benchmark

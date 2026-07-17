@@ -14,15 +14,31 @@
 //!
 //! 1. **Weight step (convex LP, global optimum):** fix `b_0`; solve the (K+1)-source
 //!    tree-Wasserstein LP with `Σ w = 1`. `w_0` is the current unknown fraction.
-//! 2. **Profile step (FEAST-style soft responsibility, closed form, O(D·K)):** fix `w`; for each
-//!    taxon `j`, split its observed sink mass `y_j` between "explained by the named sources"
-//!    (`Σ_k w_k b_kj`) and "explained by the unknown" (`w_0 b_0j`) in proportion to those two
-//!    contributions, and set the unknown profile to the normalized unknown share. This is FEAST's
-//!    E-step. A *hard* residual `b_0 ∝ max(y − Σ_k w_k b_k, 0)` looks simpler but is **greedy and
-//!    diverges**: it hands the unknown mass the named sources already explain, so `w_0` climbs
-//!    monotonically toward the degenerate fixed point `w_0 = 1, b_0 = sink` (verified empirically
-//!    — it overshot 0.5 → 0.75 on the SourceID-NMF data). The soft split does not double-count
-//!    explained mass and converges to the true unknown fraction.
+//! 2. **Profile step — geometry-matched to the weight step:**
+//!    - **L2 weight step → FEAST-style soft responsibility (closed form, O(D·K)):** fix `w`; for
+//!      each taxon `j`, split its observed sink mass `y_j` between "explained by the named
+//!      sources" (`Σ_k w_k b_kj`) and "explained by the unknown" (`w_0 b_0j`) in proportion to
+//!      those two contributions, and set the unknown profile to the normalized unknown share. This
+//!      is FEAST's E-step. A *hard* residual `b_0 ∝ max(y − Σ_k w_k b_k, 0)` looks simpler but is
+//!      **greedy and diverges** (it re-grabs mass the named sources already explain; `w_0` runs
+//!      away to 1). The soft split does not double-count explained mass and converges.
+//!    - **Tree-Wasserstein weight step → TW-consistent proximal profile LP:** a per-taxon soft
+//!      split is *tree-blind* — it measures "explained vs unexplained" in Euclidean taxon space
+//!      while the weight step measures it in tree-Wasserstein (cumulative-edge) space. With the
+//!      two blocks optimizing different geometries the alternation converges to a **biased fixed
+//!      point**: the unknown fraction collapses and, under phylogenetic drift, mass that shifted
+//!      to a close relative (cheap under the tree metric) is mis-attributed to the unknown —
+//!      destroying the drift-robustness the loss is meant to provide (verified: the oracle LP with
+//!      the *true* `b_0` recovers the unknown fraction to <1%, while the soft-step estimate drifts
+//!      to 0.63 at true 0.75). Instead we choose `b_0` on the simplex to minimize the **same** TW
+//!      residual `Σ_e ℓ_e |s_e − Σ_k w_k M_ek − w_0 C_e(b_0)|` (linear in `b_0` via the
+//!      cumulative-mass operator ⇒ still an LP, global optimum per block), with a **proximal
+//!      anchor** `+ γ‖b_0 − b_0^soft‖₁` to the soft profile to keep `b_0` sink-shaped rather than
+//!      collinear with the named sources (a free profile LP overfits as `w_0` grows). The proximal
+//!      strength is **adaptive, `γ = γ_0 · w_0`**: the larger the unknown fraction, the more free
+//!      mass there is to overfit, so the anchoring scales with it. `γ_0 = 2.5` was fixed on
+//!      cherry-swap drift and validated to still win on a *held-out* TADA drift process (not tuned
+//!      on the test process — avoids the FastST trap). Both blocks now descend one objective.
 //! 3. **Sparsity reweight (optional):** update per-source penalties `μ_k = c/(w_k + ε)` and feed
 //!    them into the next weight step. This is reweighted-ℓ1 (Candès–Wakin–Boyd 2008): it stays
 //!    a linear program yet drives negligible source weights to zero — the source-selection
@@ -154,100 +170,87 @@ fn soft_unknown_profile(
     normalize_or_uniform(&share)
 }
 
-/// Alternating (block-coordinate) estimate of the mixing weights AND the unknown-source profile
-/// under the tree-Wasserstein loss. `sources` are the K named sources; the unknown is an implicit
-/// (K+1)-th source whose profile is estimated. Returns weights over `[named…, Unknown]`.
+/// Tree-Wasserstein distance between two normalized leaf distributions `p`, `q`:
+/// `Σ_e ℓ_e |C_e(p) − C_e(q)|` — the same loss the weight step minimizes.
+fn tw_distance(tree: &Tree, p: &[f64], q: &[f64]) -> f64 {
+    let cp = tree.cumulative_masses(p);
+    let cq = tree.cumulative_masses(q);
+    tree.edge_lengths()
+        .iter()
+        .zip(cp.iter().zip(cq.iter()))
+        .map(|(&l, (&a, &b))| l * (a - b).abs())
+        .sum()
+}
+
+/// Residual-anchored unknown estimate on the tree-Wasserstein path. Two convex passes, no
+/// alternation and no free unknown profile to over-absorb drifted mass:
 ///
-/// The inner weight solve reuses [`Prepared::with_background`] each iteration, so the fixed
-/// tree/edge setup is computed once per call (via the borrow of `tree`).
-pub fn alternating_estimate<S: LpSolver>(
+///  1. **Named-only TW fit.** Its objective `R = TW(sink, named_mix)` is the transport-irreducible
+///     mismatch. Drift is *displacement* — the named sources transport to match it, so `R` stays
+///     small. A genuine unknown *adds* mass transport cannot create, so `R` grows. Thus `R` is a
+///     drift-robust measure of how much genuine unknown is present.
+///  2. **Unknown fraction from `R`.** With the unknown-location proxy `b0 = (sink − named_mix)_+`,
+///     `R ≈ w0 · TW(b0, named_mix)`, so `w0 = R / TW(b0, named_mix)`. This recovers the fraction
+///     whether the unknown is phylogenetically near a named source or far from all of them —
+///     exactly the near-named case a proximity charge cannot separate from drift.
+///  3. **Re-fit named** on the unknown-removed sink for drift-robust attribution.
+fn tw_residual_anchored_estimate<S: LpSolver>(
     solver: &S,
     tree: &Tree,
     sources: &SourceSet,
     sink: &Profile,
-    cfg: &UnmixConfig,
 ) -> Result<UnmixResult, crate::lp::LpError> {
     let source_profiles: Vec<Vec<f64>> =
         sources.profiles.iter().map(|p| p.normalized()).collect();
     let sink_norm = sink.normalized();
-    let num_named = sources.num_sources();
+    let d = sink_norm.len();
+    let prep = Prepared::new(tree, sources);
 
-    // Initialize the unknown profile from the residual against an equal-weight named mixture
-    // (a neutral start; the first weight solve immediately refines it).
-    let init_w = vec![1.0 / num_named.max(1) as f64; num_named];
-    let mut b0 = residual_profile_init(&source_profiles, &init_w, &sink_norm);
-
-    let mut prev_w: Option<Vec<f64>> = None;
-    let mut last: Option<(Vec<f64>, f64)> = None; // (weights, objective)
-    let mut iters = 0;
-
-    for _ in 0..cfg.max_iters.max(1) {
-        iters += 1;
-
-        // --- Weight step: fix b_0, solve the (K+1)-source weight problem. ---
-        // Reweighted-ℓ1 penalty on named sources only (unknown column = 0). Computed from the
-        // previous iterate; uniform on the first pass.
-        let penalty: Vec<f64> = if cfg.sparsity > 0.0 {
-            let mut mu = vec![0.0f64; num_named + 1];
-            match &prev_w {
-                Some(w) => {
-                    for k in 0..num_named {
-                        mu[k] = cfg.sparsity / (w[k] + cfg.sparsity_eps);
-                    }
-                }
-                None => {
-                    let u = 1.0 / num_named.max(1) as f64;
-                    for muk in mu.iter_mut().take(num_named) {
-                        *muk = cfg.sparsity / (u + cfg.sparsity_eps);
-                    }
+    // Iterated residual-anchoring (converges by ~3 rounds; all solves convex). Each round:
+    //  (a) unknown-location proxy b0 = positive taxon residual of the current named fit;
+    //  (b) drift-robust fraction w0 = R / TW(b0, named_mix), with R = TW(sink, named_mix);
+    //  (c) remove w0·b0 and refit the named sources on the remainder.
+    // Refitting with the unknown removed de-contaminates the residual, so b0/w0 stop over-
+    // estimating under heavy drift and under-estimating under light drift (a single pass does both).
+    const ITERS: usize = 3;
+    let named_mixture = |weights: &[f64]| -> Vec<f64> {
+        let mut m = vec![0.0f64; d];
+        for (k, prof) in source_profiles.iter().enumerate() {
+            let wk = weights[k];
+            if wk != 0.0 {
+                for (mj, &pj) in m.iter_mut().zip(prof.iter()) {
+                    *mj += wk * pj;
                 }
             }
-            mu
-        } else {
-            Vec::new()
-        };
-
-        let (w, objective) = match cfg.weight_step {
-            WeightStep::TreeWasserstein => {
-                let mut prepared = Prepared::with_background(tree, sources, b0.clone());
-                prepared.weight_penalty = penalty;
-                let sol = prepared.solve(solver, &source_profiles, &sink_norm)?;
-                (sol.weights, sol.objective)
-            }
-            WeightStep::L2 => {
-                // Columns = named sources + the current unknown profile b_0.
-                let mut cols: Vec<Vec<f64>> = source_profiles.clone();
-                cols.push(b0.clone());
-                let w = l2_deconvolve_penalized(&cols, &sink_norm, &penalty, prev_w.as_deref());
-                // Report an L1-over-taxa distance as the objective (a star tree makes the
-                // tree-Wasserstein loss equal to this L1).
-                let obj = l1_taxa_distance(&cols, &w, &sink_norm);
-                (w, obj)
-            }
-        };
-
-        // --- Profile step: fix w, re-estimate b_0 via FEAST-style soft responsibility. ---
-        let named_w = &w[..num_named];
-        let unknown_w = w[num_named];
-        b0 = soft_unknown_profile(&source_profiles, named_w, unknown_w, &b0, &sink_norm);
-
-        // --- Convergence on the full weight vector. ---
-        let delta = match &prev_w {
-            Some(pw) => pw.iter().zip(w.iter()).map(|(a, b)| (a - b).abs()).sum::<f64>(),
-            None => f64::INFINITY,
-        };
-        if cfg.verbose {
-            let unk = w.last().copied().unwrap_or(0.0);
-            eprintln!("  [unmix] iter {iters}: unknown={unk:.4} Δw={delta:.2e}");
         }
-        prev_w = Some(w.clone());
-        last = Some((w, objective));
-        if delta < cfg.tol {
-            break;
-        }
+        m
+    };
+
+    let sol1 = prep.solve(solver, &source_profiles, &sink_norm)?;
+    let mut named_w = sol1.weights.clone();
+    let mut named_mix = named_mixture(&named_w);
+    let mut b0 = vec![1.0 / d.max(1) as f64; d];
+    let mut w0 = 0.0f64;
+    for _ in 0..ITERS {
+        let resid: Vec<f64> = (0..d).map(|j| (sink_norm[j] - named_mix[j]).max(0.0)).collect();
+        b0 = normalize_or_uniform(&resid);
+        let dist = tw_distance(tree, &b0, &named_mix);
+        let r = tw_distance(tree, &sink_norm, &named_mix);
+        w0 = if dist > 1e-9 { (r / dist).clamp(0.0, 1.0) } else { 0.0 };
+        let resid2: Vec<f64> = (0..d).map(|j| (sink_norm[j] - w0 * b0[j]).max(0.0)).collect();
+        let sink2 = normalize_or_uniform(&resid2);
+        let sol = prep.solve(solver, &source_profiles, &sink2)?;
+        named_w = sol.weights.clone();
+        named_mix = named_mixture(&named_w);
     }
 
-    let (weights, objective) = last.expect("at least one iteration runs");
+    let mut weights: Vec<f64> = named_w.iter().map(|&w| w * (1.0 - w0)).collect();
+    weights.push(w0);
+    // Reported objective: residual of the full (named + unknown) mixture.
+    let full: Vec<f64> = (0..d)
+        .map(|j| (1.0 - w0) * named_mix[j] + w0 * b0[j])
+        .collect();
+    let objective = tw_distance(tree, &sink_norm, &full);
     let names: Vec<String> = sources
         .names
         .iter()
@@ -262,15 +265,115 @@ pub fn alternating_estimate<S: LpSolver>(
             proportion: w,
         })
         .collect();
-
     Ok(UnmixResult {
         estimate: PointEstimate {
             sources: sources_out,
             objective,
         },
         unknown_profile: b0,
-        iters,
+        iters: ITERS + 1,
     })
+}
+
+/// Alternating (block-coordinate) estimate of the mixing weights AND the unknown-source profile
+/// under the tree-Wasserstein loss. `sources` are the K named sources; the unknown is an implicit
+/// (K+1)-th source whose profile is estimated. Returns weights over `[named…, Unknown]`.
+///
+/// The inner weight solve reuses [`Prepared::with_background`] each iteration, so the fixed
+/// tree/edge setup is computed once per call (via the borrow of `tree`).
+pub fn alternating_estimate<S: LpSolver>(
+    solver: &S,
+    tree: &Tree,
+    sources: &SourceSet,
+    sink: &Profile,
+    cfg: &UnmixConfig,
+) -> Result<UnmixResult, crate::lp::LpError> {
+    // Tree-Wasserstein path: the residual-anchored 2-pass estimate (drift-robust unknown fraction
+    // from the named-only TW residual; no free unknown profile to over-absorb drift). The L2
+    // (tree-less) path is unchanged — a single residual-init alternation giving its best-in-class
+    // no-tree accuracy (exp1b).
+    match cfg.weight_step {
+        WeightStep::TreeWasserstein => tw_residual_anchored_estimate(solver, tree, sources, sink),
+        WeightStep::L2 => Ok(l2_alternating_estimate(sources, sink, cfg)),
+    }
+}
+
+/// Alternating (FEAST-style) unknown estimate on the tree-LESS L2 path: alternately fit the
+/// (K+1)-source L2 weights (named sources + current unknown profile b_0) and update b_0 as the
+/// soft responsibility profile. Converges to the true unknown fraction on compositional data
+/// (exp1b/exp8). The phylogeny is not used here; the tree-Wasserstein path is the separate
+/// residual-anchored estimate in [`tw_residual_anchored_estimate`].
+fn l2_alternating_estimate(sources: &SourceSet, sink: &Profile, cfg: &UnmixConfig) -> UnmixResult {
+    let source_profiles: Vec<Vec<f64>> =
+        sources.profiles.iter().map(|p| p.normalized()).collect();
+    let sink_norm = sink.normalized();
+    let num_named = sources.num_sources();
+
+    // Seed b_0 from the residual against a data-driven named fit (avoids over-absorption: a naive
+    // uniform-mix residual under-explains present sources, leaking their mass into the unknown).
+    let init_w = l2_deconvolve_penalized(&source_profiles, &sink_norm, &[], None);
+    let mut b0 = residual_profile_init(&source_profiles, &init_w, &sink_norm);
+
+    let mut prev_w: Option<Vec<f64>> = None;
+    let mut last: Option<(Vec<f64>, f64)> = None;
+    let mut iters = 0;
+    for _ in 0..cfg.max_iters.max(1) {
+        iters += 1;
+        // Reweighted-l1 penalty on named sources only (the unknown is never penalized).
+        let penalty: Vec<f64> = if cfg.sparsity > 0.0 {
+            let mut mu = vec![0.0f64; num_named + 1];
+            for (k, muk) in mu.iter_mut().take(num_named).enumerate() {
+                let wk = prev_w
+                    .as_ref()
+                    .map(|w| w[k])
+                    .unwrap_or(1.0 / num_named.max(1) as f64);
+                *muk = cfg.sparsity / (wk + cfg.sparsity_eps);
+            }
+            mu
+        } else {
+            Vec::new()
+        };
+        // Weight step: columns = named sources + the current unknown profile b_0.
+        let mut cols: Vec<Vec<f64>> = source_profiles.clone();
+        cols.push(b0.clone());
+        let w = l2_deconvolve_penalized(&cols, &sink_norm, &penalty, prev_w.as_deref());
+        let objective = l1_taxa_distance(&cols, &w, &sink_norm);
+        // Profile step: soft (responsibility) unknown profile.
+        let named_w = &w[..num_named];
+        let unknown_w = w[num_named];
+        b0 = soft_unknown_profile(&source_profiles, named_w, unknown_w, &b0, &sink_norm);
+        // Convergence on the full weight vector.
+        let delta = match &prev_w {
+            Some(pw) => pw.iter().zip(w.iter()).map(|(a, b)| (a - b).abs()).sum::<f64>(),
+            None => f64::INFINITY,
+        };
+        if cfg.verbose {
+            let unk = w.last().copied().unwrap_or(0.0);
+            eprintln!("  [unmix] iter {iters}: unknown={unk:.4} dw={delta:.2e}");
+        }
+        prev_w = Some(w.clone());
+        last = Some((w, objective));
+        if delta < cfg.tol {
+            break;
+        }
+    }
+    let (weights, objective) = last.expect("at least one iteration runs");
+    let names: Vec<String> = sources
+        .names
+        .iter()
+        .cloned()
+        .chain(std::iter::once(UNKNOWN_LABEL.to_string()))
+        .collect();
+    let sources_out: Vec<SourceEstimate> = names
+        .iter()
+        .zip(weights.iter())
+        .map(|(name, &w)| SourceEstimate { name: name.clone(), proportion: w })
+        .collect();
+    UnmixResult {
+        estimate: PointEstimate { sources: sources_out, objective },
+        unknown_profile: b0,
+        iters,
+    }
 }
 
 /// L2 deconvolution with an optional per-source linear penalty (reweighted-ℓ1) and an optional

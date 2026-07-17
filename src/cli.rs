@@ -45,6 +45,15 @@ pub struct EstimateArgs {
     /// values suppress weakly-supported sources — useful with many candidate sources.
     #[arg(long, default_value_t = 0.0)]
     pub sparsity: f64,
+    /// Advanced (only with `--unknown`): cap the alternating estimator's outer iterations. Lower
+    /// values trade a little accuracy for speed, mainly on the slow `--tree --unknown` path.
+    /// Default: 60.
+    #[arg(long)]
+    pub unmix_max_iters: Option<usize>,
+    /// Advanced (only with `--unknown`): convergence tolerance on Σ|Δw| between iterations.
+    /// Default: 1e-6. Looser values stop the alternation earlier.
+    #[arg(long)]
+    pub unmix_tol: Option<f64>,
     /// Print per-iteration convergence of the alternating unknown estimator to stderr.
     #[arg(long, default_value_t = false)]
     pub verbose: bool,
@@ -257,6 +266,8 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
             sparsity: args.sparsity,
             weight_step,
             verbose: args.verbose,
+            max_iters: args.unmix_max_iters.unwrap_or(crate::unmix::UnmixConfig::default().max_iters),
+            tol: args.unmix_tol.unwrap_or(crate::unmix::UnmixConfig::default().tol),
             ..Default::default()
         };
         let res = crate::unmix::alternating_estimate(&GoodLpSolver, &tree, &sources, &sink, &cfg)

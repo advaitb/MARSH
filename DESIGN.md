@@ -1,8 +1,8 @@
-# CLAUDE.md — OT-based Microbial Source Tracking (Rust)
+# OTST — Design & Implementation Notes (Rust)
 
-Project context for Claude Code. Read this before writing code. Companion design doc:
-the "Optimal-Transport Microbial Source Tracking" whitepaper (Google Doc). This file is
-the implementation spec; the whitepaper is the rationale.
+Implementation specification and design rationale for OTST (optimal-transport microbial
+source tracking). Companion to the "Optimal-Transport Microbial Source Tracking"
+whitepaper, which carries the full rationale.
 
 ---
 
