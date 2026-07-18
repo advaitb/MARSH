@@ -208,7 +208,8 @@ fn tw_residual_anchored_estimate<S: LpSolver>(
 
     // Iterated residual-anchoring (converges by ~3 rounds; all solves convex). Each round:
     //  (a) unknown-location proxy b0 = positive taxon residual of the current named fit;
-    //  (b) drift-robust fraction w0 = R / TW(b0, named_mix), with R = TW(sink, named_mix);
+    //  (b) drift-robust fraction w0 = R / max(TW(b0, named_mix), mean_c TW(source_c, named_mix)),
+    //      R = TW(sink, named_mix); flooring the denominator keeps w0 stable under heavy drift;
     //  (c) remove w0·b0 and refit the named sources on the remainder.
     // Refitting with the unknown removed de-contaminates the residual, so b0/w0 stop over-
     // estimating under heavy drift and under-estimating under light drift (a single pass does both).
@@ -234,7 +235,19 @@ fn tw_residual_anchored_estimate<S: LpSolver>(
     for _ in 0..ITERS {
         let resid: Vec<f64> = (0..d).map(|j| (sink_norm[j] - named_mix[j]).max(0.0)).collect();
         b0 = normalize_or_uniform(&resid);
-        let dist = tw_distance(tree, &b0, &named_mix);
+        // Denominator = distance from the unknown-location proxy b0 to the named mix, FLOORED at
+        // the mean source-to-mix tree distance. Rationale: a genuine unknown source is at least as
+        // phylogenetically distinct as a typical named source. Under heavy drift b0 is dragged
+        // toward the named mix (its residual mass lands on near-named congeners), collapsing this
+        // distance and spuriously inflating w0; the floor is a drift-invariant scale (sources and
+        // mix do not drift) that prevents the collapse without any tuned parameter.
+        let dist_b0 = tw_distance(tree, &b0, &named_mix);
+        let src_scale = source_profiles
+            .iter()
+            .map(|s| tw_distance(tree, s, &named_mix))
+            .sum::<f64>()
+            / source_profiles.len().max(1) as f64;
+        let dist = dist_b0.max(src_scale);
         let r = tw_distance(tree, &sink_norm, &named_mix);
         w0 = if dist > 1e-9 { (r / dist).clamp(0.0, 1.0) } else { 0.0 };
         let resid2: Vec<f64> = (0..d).map(|j| (sink_norm[j] - w0 * b0[j]).max(0.0)).collect();
