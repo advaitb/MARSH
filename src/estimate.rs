@@ -33,7 +33,7 @@ impl<'t> Prepared<'t> {
     pub fn new(tree: &'t Tree, sources: &SourceSet) -> Self {
         Prepared {
             tree,
-            edge_lengths: tree.edge_lengths(),
+            edge_lengths: tree.locality_bounded_edge_lengths(),
             source_names: sources.names.clone(),
             background: None,
             num_named: sources.num_sources(),
@@ -50,7 +50,7 @@ impl<'t> Prepared<'t> {
         source_names.push(UNKNOWN_LABEL.to_string());
         Prepared {
             tree,
-            edge_lengths: tree.edge_lengths(),
+            edge_lengths: tree.locality_bounded_edge_lengths(),
             source_names,
             background: Some(background),
             num_named: sources.num_sources(),

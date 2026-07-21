@@ -171,11 +171,13 @@ fn soft_unknown_profile(
 }
 
 /// Tree-Wasserstein distance between two normalized leaf distributions `p`, `q`:
-/// `Σ_e ℓ_e |C_e(p) − C_e(q)|` — the same loss the weight step minimizes.
-fn tw_distance(tree: &Tree, p: &[f64], q: &[f64]) -> f64 {
+/// `Σ_e ℓ_e |C_e(p) − C_e(q)|` — the same loss the weight step minimizes. `edge_len` are the
+/// (locality-bounded) edge lengths used by the fit, passed in so the distance and the LP share
+/// exactly one metric.
+fn tw_distance(tree: &Tree, edge_len: &[f64], p: &[f64], q: &[f64]) -> f64 {
     let cp = tree.cumulative_masses(p);
     let cq = tree.cumulative_masses(q);
-    tree.edge_lengths()
+    edge_len
         .iter()
         .zip(cp.iter().zip(cq.iter()))
         .map(|(&l, (&a, &b))| l * (a - b).abs())
@@ -241,14 +243,14 @@ fn tw_residual_anchored_estimate<S: LpSolver>(
         // toward the named mix (its residual mass lands on near-named congeners), collapsing this
         // distance and spuriously inflating w0; the floor is a drift-invariant scale (sources and
         // mix do not drift) that prevents the collapse without any tuned parameter.
-        let dist_b0 = tw_distance(tree, &b0, &named_mix);
+        let dist_b0 = tw_distance(tree, &prep.edge_lengths, &b0, &named_mix);
         let src_scale = source_profiles
             .iter()
-            .map(|s| tw_distance(tree, s, &named_mix))
+            .map(|s| tw_distance(tree, &prep.edge_lengths, s, &named_mix))
             .sum::<f64>()
             / source_profiles.len().max(1) as f64;
         let dist = dist_b0.max(src_scale);
-        let r = tw_distance(tree, &sink_norm, &named_mix);
+        let r = tw_distance(tree, &prep.edge_lengths, &sink_norm, &named_mix);
         w0 = if dist > 1e-9 { (r / dist).clamp(0.0, 1.0) } else { 0.0 };
         let resid2: Vec<f64> = (0..d).map(|j| (sink_norm[j] - w0 * b0[j]).max(0.0)).collect();
         let sink2 = normalize_or_uniform(&resid2);
@@ -263,7 +265,7 @@ fn tw_residual_anchored_estimate<S: LpSolver>(
     let full: Vec<f64> = (0..d)
         .map(|j| (1.0 - w0) * named_mix[j] + w0 * b0[j])
         .collect();
-    let objective = tw_distance(tree, &sink_norm, &full);
+    let objective = tw_distance(tree, &prep.edge_lengths, &sink_norm, &full);
     let names: Vec<String> = sources
         .names
         .iter()
