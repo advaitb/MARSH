@@ -1,6 +1,6 @@
-# OTST — Optimal-Transport Microbial Source Tracking
+# MARSH — Optimal-Transport Microbial Source Tracking
 
-OTST estimates the mixing proportions of a microbial **sink** community over a set of candidate
+MARSH estimates the mixing proportions of a microbial **sink** community over a set of candidate
 **source** communities. Unlike count-matching methods, it can score the fit under a **phylogeny-aware
 tree-Wasserstein loss**, so a sink whose taxa have *drifted* to nearby relatives of the reference
 taxa (different 16S region, sequencing technology, strain-level turnover) is still attributed to the
@@ -13,13 +13,13 @@ Written in Rust; the linear programs are solved with a pure-Rust LP backend (no 
 
 ```bash
 cargo build --release
-# binary: target/release/otst
+# binary: target/release/marsh
 ```
 
 ## Usage
 
 ```bash
-otst estimate \
+marsh estimate \
   --sources sources.tsv \      # TSV: rows = taxa, columns = source samples
   --sink    sink.tsv \         # TSV: same taxa rows, a single sink column
   [--tree   tree.nwk] \        # Newick over the taxa -> phylogeny-aware tree-Wasserstein loss
@@ -30,14 +30,17 @@ otst estimate \
 
 - **Without `--tree`**: fits a plain L2 loss over taxa — the right choice for tree-less OTU tables or
   when there is no phylogenetic drift between sources and sink.
-- **With `--tree`**: fits the tree-Wasserstein loss, which transports drifted mass back to the
-  correct source across phylogenetically-local feature mismatch.
+- **With `--tree`**: fits the **locality-bounded** tree-Wasserstein loss, which transports drifted
+  mass back to the correct source across phylogenetically-local feature mismatch. Transport is
+  confined to local clades (edges above the √D-leaf scale are dropped), so the loss stays robust to
+  local drift without over-smoothing under global/temporal turnover — the parameter-free scale is
+  derived from the tree alone.
 - **With `--unknown`**: estimates the fraction of the sink coming from sources not in the reference
   set. On the `--tree --unknown` path this uses a residual-anchored estimator that separates a
   genuine unknown source from drift with no tuned parameter.
 
 Output is JSON: per-source proportions, the unknown fraction (if `--unknown`), the objective, and
-bootstrap confidence intervals (if enabled). Run `otst estimate --help` for the full flag list.
+bootstrap confidence intervals (if enabled). Run `marsh estimate --help` for the full flag list.
 
 ### Input format
 
@@ -47,7 +50,7 @@ Newick leaf labels (`--on-missing drop` tolerates table taxa absent from the tre
 
 ## Method
 
-OTST casts source tracking as a constrained optimal-transport fit: find source weights (and an
+MARSH casts source tracking as a constrained optimal-transport fit: find source weights (and an
 optional unknown profile) whose mixture minimizes the tree-Wasserstein (or L2) distance to the sink,
 solved as a linear program. Uncertainty comes from a parallel multinomial bootstrap. See
 [`DESIGN.md`](DESIGN.md) for the full specification and rationale.

@@ -2,7 +2,7 @@
 name = "otst"
 version = "0.1.0"
 edition = "2021"
-description = "Optimal-transport (tree-Wasserstein) microbial source tracking"
+description = "MARSH: optimal-transport (tree-Wasserstein) microbial source tracking"
 license = "MIT OR Apache-2.0"
 
 [lib]
@@ -10,7 +10,7 @@ name = "otst"
 path = "src/lib.rs"
 
 [[bin]]
-name = "otst"
+name = "marsh"
 path = "src/main.rs"
 
 [[bin]]
