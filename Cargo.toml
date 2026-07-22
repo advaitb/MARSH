@@ -14,7 +14,7 @@ name = "marsh"
 path = "src/main.rs"
 
 [[bin]]
-name = "otst-experiments"
+name = "marsh-experiments"
 path = "src/bin/experiments.rs"
 
 [[bin]]

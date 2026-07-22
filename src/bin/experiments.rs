@@ -4,7 +4,7 @@
 //! numbers rather than asserting thresholds.
 //!
 //! Usage:
-//!   cargo run --release --bin otst-experiments -- [drift|depth|coverage|all]
+//!   cargo run --release --bin marsh-experiments -- [drift|depth|coverage|all]
 
 use marsh::baseline::l2_deconvolve;
 use marsh::bootstrap::{self, BootstrapConfig, IntervalMethod};
