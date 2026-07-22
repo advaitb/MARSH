@@ -1,4 +1,4 @@
-//! `otst` binary entry point.
+//! `marsh` binary entry point.
 
 use clap::Parser;
 use marsh::cli::{run, Cli};

@@ -1,4 +1,4 @@
-//! # otst — optimal-transport microbial source tracking
+//! # marsh — optimal-transport microbial source tracking
 //!
 //! Estimates what fraction of a sink microbial community came from each candidate source,
 //! using a **tree-Wasserstein (weighted UniFrac) loss**. The point estimate is a convex linear
