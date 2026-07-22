@@ -6,14 +6,14 @@
 //! Usage:
 //!   cargo run --release --bin otst-experiments -- [drift|depth|coverage|all]
 
-use otst::baseline::l2_deconvolve;
-use otst::bootstrap::{self, BootstrapConfig, IntervalMethod};
-use otst::estimate::Prepared;
-use otst::lp::GoodLpSolver;
-use otst::sim::{generate, l1_error, Scenario, SimConfig};
-use otst::tree::Tree;
+use marsh::baseline::l2_deconvolve;
+use marsh::bootstrap::{self, BootstrapConfig, IntervalMethod};
+use marsh::estimate::Prepared;
+use marsh::lp::GoodLpSolver;
+use marsh::sim::{generate, l1_error, Scenario, SimConfig};
+use marsh::tree::Tree;
 
-/// Solve OTST against an ARBITRARY tree (not the scenario's own), aligning by leaf name. Used to
+/// Solve MARSH against an ARBITRARY tree (not the scenario's own), aligning by leaf name. Used to
 /// compare the true tree vs a star tree on the same drifted data.
 fn solve_ot_with_tree(sc: &Scenario, tree: &Tree) -> Vec<f64> {
     let prepared = Prepared::new(tree, &sc.sources);
@@ -175,7 +175,7 @@ fn report_coverage(label: &str, drift: f64) {
     );
 }
 
-/// Experiment 5: isolate the phylogeny's contribution. On the SAME drifted data, compare OTST
+/// Experiment 5: isolate the phylogeny's contribution. On the SAME drifted data, compare MARSH
 /// with the true tree vs a star tree (tree-Wasserstein → L1) vs the L2 baseline. The true-tree
 /// column should stay flat under drift while star/L2 degrade.
 fn tree_benefit_sweep() {

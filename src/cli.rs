@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "otst", version, about = "Optimal-transport microbial source tracking")]
+#[command(name = "marsh", version, about = "MARSH: optimal-transport microbial source tracking")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -31,9 +31,9 @@ pub struct EstimateArgs {
     /// Sink count table (TSV): a single sample column, same taxa rows.
     #[arg(long)]
     pub sink: PathBuf,
-    /// Newick tree over the taxa. When given, OTST fits under the phylogeny-aware
+    /// Newick tree over the taxa. When given, MARSH fits under the phylogeny-aware
     /// tree-Wasserstein loss (drift-robust). When OMITTED, there is no phylogeny to exploit and
-    /// OTST fits under a plain L2 loss over taxa — use this for tree-less OTU tables.
+    /// MARSH fits under a plain L2 loss over taxa — use this for tree-less OTU tables.
     #[arg(long)]
     pub tree: Option<PathBuf>,
     /// Estimate an unknown (unobserved) source jointly with the mixing weights. Off by default

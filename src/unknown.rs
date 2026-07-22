@@ -1,6 +1,6 @@
 //! Unknown-source handling.
 //!
-//! OTST models an unknown source in exactly one way: the joint profile+weights estimator in
+//! MARSH models an unknown source in exactly one way: the joint profile+weights estimator in
 //! [`crate::unmix`] (`--unknown`), which re-estimates the unknown's *shape* in an outer
 //! alternating loop while the inner weight solve stays convex. When `--unknown` is not requested,
 //! no unknown source is modeled and the named sources must explain all sink mass (`Σ w = 1`).

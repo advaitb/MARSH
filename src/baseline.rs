@@ -4,7 +4,7 @@
 //! of source profiles (columns) and `p` is the sink composition. This is the standard
 //! least-squares deconvolution used (in spirit) by non-phylogenetic methods. It **ignores the
 //! tree entirely** — mass moved to a phylogenetic neighbor is penalized exactly as much as mass
-//! moved anywhere else. Comparing OTST against this isolates the contribution of the
+//! moved anywhere else. Comparing MARSH against this isolates the contribution of the
 //! tree-Wasserstein ground metric (spec §6.4).
 //!
 //! Solved by projected gradient descent: the objective is convex with Lipschitz-continuous

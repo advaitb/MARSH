@@ -9,15 +9,15 @@
 //! These use averages over multiple seeds to be robust to sampling noise while staying fast
 //! enough for CI. They assert the *directional* claims of the whitepaper, not exact numbers.
 
-use otst::baseline::l2_deconvolve;
-use otst::bootstrap::{self, BootstrapConfig, IntervalMethod};
-use otst::estimate::Prepared;
-use otst::lp::GoodLpSolver;
-use otst::sim::{generate, l1_error, DriftModel, ProfileModel, SimConfig};
+use marsh::baseline::l2_deconvolve;
+use marsh::bootstrap::{self, BootstrapConfig, IntervalMethod};
+use marsh::estimate::Prepared;
+use marsh::lp::GoodLpSolver;
+use marsh::sim::{generate, l1_error, DriftModel, ProfileModel, SimConfig};
 
 /// Solve one scenario with the tree-Wasserstein OT estimator (v1, no unknown source), returning
 /// the named-source weights.
-fn solve_ot(scenario: &otst::sim::Scenario) -> Vec<f64> {
+fn solve_ot(scenario: &marsh::sim::Scenario) -> Vec<f64> {
     let prepared = Prepared::new(&scenario.tree, &scenario.sources);
     let src_norm: Vec<Vec<f64>> = scenario
         .sources
@@ -33,7 +33,7 @@ fn solve_ot(scenario: &otst::sim::Scenario) -> Vec<f64> {
 }
 
 /// Solve one scenario with the non-phylogenetic L2 baseline.
-fn solve_l2(scenario: &otst::sim::Scenario) -> Vec<f64> {
+fn solve_l2(scenario: &marsh::sim::Scenario) -> Vec<f64> {
     let src_norm: Vec<Vec<f64>> = scenario
         .sources
         .profiles
@@ -44,7 +44,7 @@ fn solve_l2(scenario: &otst::sim::Scenario) -> Vec<f64> {
 }
 
 /// Mean L1 error of a method over `n_seeds` scenarios at a given config.
-fn mean_error(config: &SimConfig, n_seeds: u64, method: impl Fn(&otst::sim::Scenario) -> Vec<f64>) -> f64 {
+fn mean_error(config: &SimConfig, n_seeds: u64, method: impl Fn(&marsh::sim::Scenario) -> Vec<f64>) -> f64 {
     let mut total = 0.0;
     for seed in 0..n_seeds {
         let sc = generate(config, seed * 100 + 1);

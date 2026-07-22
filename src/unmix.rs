@@ -3,7 +3,7 @@
 //!
 //! The v1 estimator ([`crate::estimate::point_estimate`]) can only model the unknown as a
 //! *fixed* background profile `b_0` (uniform or metacommunity). When the sink has a large
-//! genuine unknown fraction with a shape unlike any fixed guess — the regime where OTST scored
+//! genuine unknown fraction with a shape unlike any fixed guess — the regime where MARSH scored
 //! L1 ≈ 1.0 in the cross-method benchmark — that fixed profile is simply wrong and the fit
 //! collapses. The methods that do well there (FEAST, SourceID-NMF, STENSL) all share one
 //! ingredient: they **estimate the unknown profile jointly with the weights**.
@@ -60,7 +60,7 @@ use crate::unknown::UNKNOWN_LABEL;
 /// Which loss the inner weight sub-problem minimizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightStep {
-    /// Tree-Wasserstein LAD LP (OTST's phylogeny-aware loss). Use when an informative tree is
+    /// Tree-Wasserstein LAD LP (MARSH's phylogeny-aware loss). Use when an informative tree is
     /// available — this is where the drift-robustness lives.
     TreeWasserstein,
     /// Plain L2 (Euclidean) deconvolution over the simplex. On tree-LESS data the ground metric

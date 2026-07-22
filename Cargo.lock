@@ -396,6 +396,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "marsh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "approx",
+ "clap",
+ "criterion",
+ "good_lp",
+ "rand",
+ "rand_chacha",
+ "rand_distr",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "matrixmultiply"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -482,24 +500,6 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
-
-[[package]]
-name = "otst"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "approx",
- "clap",
- "criterion",
- "good_lp",
- "rand",
- "rand_chacha",
- "rand_distr",
- "rayon",
- "serde",
- "serde_json",
- "thiserror",
-]
 
 [[package]]
 name = "page_size"

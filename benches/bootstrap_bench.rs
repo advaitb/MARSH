@@ -4,11 +4,11 @@
 //! Run with: `cargo bench --bench bootstrap_bench`
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use otst::bootstrap::{self, BootstrapConfig, IntervalMethod};
-use otst::estimate::Prepared;
-use otst::lp::GoodLpSolver;
-use otst::sim::{generate, SimConfig};
-use otst::unknown::UnknownMode;
+use marsh::bootstrap::{self, BootstrapConfig, IntervalMethod};
+use marsh::estimate::Prepared;
+use marsh::lp::GoodLpSolver;
+use marsh::sim::{generate, SimConfig};
+use marsh::unknown::UnknownMode;
 use std::hint::black_box;
 
 fn bench_replicates(c: &mut Criterion) {

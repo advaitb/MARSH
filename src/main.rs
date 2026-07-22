@@ -1,7 +1,7 @@
 //! `otst` binary entry point.
 
 use clap::Parser;
-use otst::cli::{run, Cli};
+use marsh::cli::{run, Cli};
 
 fn main() {
     let cli = Cli::parse();

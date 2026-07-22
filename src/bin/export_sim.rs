@@ -1,13 +1,13 @@
 //! Export simulated, TREE-BEARING source-tracking scenarios to disk so the phylogeny-benefit
-//! benchmark can run OTST (with the real tree) head-to-head against the tree-blind competitors
+//! benchmark can run MARSH (with the real tree) head-to-head against the tree-blind competitors
 //! (FEAST, FastST, SourceID-NMF) on the SAME data.
 //!
 //! Unlike the FastST/SourceID-NMF datasets, these sims ship a real phylogeny and apply
 //! TADA-style phylogenetic drift to the sink — the regime where the tree-Wasserstein loss is
 //! supposed to pay off. Each replicate writes four files under `<out_dir>/rep_<i>/`:
-//!   sources.tsv  — taxa × K source count columns (OTST/FEAST/etc. input)
+//!   sources.tsv  — taxa × K source count columns (MARSH/FEAST/etc. input)
 //!   sink.tsv     — taxa × 1 sink count column
-//!   tree.nwk     — the true Newick tree (fed to OTST via --tree; competitors ignore it)
+//!   tree.nwk     — the true Newick tree (fed to MARSH via --tree; competitors ignore it)
 //!   truth.csv    — header row `unknown,S0,S1,…`; one data row of ground-truth proportions
 //!
 //! Usage:
@@ -18,7 +18,7 @@
 //! `tada` (whole-tree Beta-split perturbation). Example:
 //!   export_sim benchmark/data/phylo 30 0.3
 
-use otst::sim::{generate, DriftModel, ProfileModel, SimConfig};
+use marsh::sim::{generate, DriftModel, ProfileModel, SimConfig};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -98,7 +98,7 @@ fn main() {
     );
 }
 
-fn write_sources(dir: &str, taxa: &[String], sources: &otst::profile::SourceSet) {
+fn write_sources(dir: &str, taxa: &[String], sources: &marsh::profile::SourceSet) {
     let path = Path::new(dir).join("sources.tsv");
     let mut f = fs::File::create(&path).expect("create sources.tsv");
     // header
@@ -117,7 +117,7 @@ fn write_sources(dir: &str, taxa: &[String], sources: &otst::profile::SourceSet)
     }
 }
 
-fn write_sink(dir: &str, taxa: &[String], sink: &otst::profile::Profile) {
+fn write_sink(dir: &str, taxa: &[String], sink: &marsh::profile::Profile) {
     let path = Path::new(dir).join("sink.tsv");
     let mut f = fs::File::create(&path).expect("create sink.tsv");
     writeln!(f, "taxon\tsink").unwrap();
