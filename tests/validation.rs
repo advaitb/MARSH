@@ -13,7 +13,7 @@ use otst::baseline::l2_deconvolve;
 use otst::bootstrap::{self, BootstrapConfig, IntervalMethod};
 use otst::estimate::Prepared;
 use otst::lp::GoodLpSolver;
-use otst::sim::{generate, l1_error, DriftModel, SimConfig};
+use otst::sim::{generate, l1_error, DriftModel, ProfileModel, SimConfig};
 
 /// Solve one scenario with the tree-Wasserstein OT estimator (v1, no unknown source), returning
 /// the named-source weights.
@@ -66,6 +66,7 @@ fn experiment_drift_sweep_ot_beats_l2() {
         unknown_fraction: 0.0,
         drift: 0.0,
         drift_model: DriftModel::CherrySwap,
+        profile_model: ProfileModel::IidDirichlet,
         sink_depth: 20_000,
         source_depth: 20_000,
     };
@@ -114,6 +115,7 @@ fn experiment_depth_sweep_converges() {
         unknown_fraction: 0.0,
         drift: 0.0,
         drift_model: DriftModel::CherrySwap,
+        profile_model: ProfileModel::IidDirichlet,
         sink_depth: 0,
         source_depth: 0,
     };
@@ -157,6 +159,7 @@ fn experiment_coverage_is_near_nominal() {
         unknown_fraction: 0.0,
         drift: 0.0,
         drift_model: DriftModel::CherrySwap,
+        profile_model: ProfileModel::IidDirichlet,
         sink_depth: 5_000,
         source_depth: 5_000,
     };
