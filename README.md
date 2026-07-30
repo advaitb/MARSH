@@ -52,8 +52,7 @@ Newick leaf labels (`--on-missing drop` tolerates table taxa absent from the tre
 
 MARSH casts source tracking as a constrained optimal-transport fit: find source weights (and an
 optional unknown profile) whose mixture minimizes the tree-Wasserstein (or L2) distance to the sink,
-solved as a linear program. Uncertainty comes from a parallel multinomial bootstrap. See
-[`DESIGN.md`](DESIGN.md) for the full specification and rationale.
+solved as a linear program. Uncertainty comes from a parallel multinomial bootstrap.
 
 ## Benchmarks & paper experiments
 
