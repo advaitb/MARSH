@@ -249,7 +249,13 @@ fn tw_residual_anchored_estimate<S: LpSolver>(
             .map(|s| tw_distance(tree, &prep.edge_lengths, s, &named_mix))
             .sum::<f64>()
             / source_profiles.len().max(1) as f64;
-        let dist = dist_b0.max(src_scale);
+        // Ablation hook (reproducibility only, NOT a user tuning knob): setting
+        // MARSH_ABLATE_NO_FLOOR=1 disables the denominator floor so the published ablation
+        // ("without the floor w0 inflates under heavy drift") can be reproduced exactly.
+        let ablate_floor = std::env::var("MARSH_ABLATE_NO_FLOOR")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let dist = if ablate_floor { dist_b0 } else { dist_b0.max(src_scale) };
         let r = tw_distance(tree, &prep.edge_lengths, &sink_norm, &named_mix);
         w0 = if dist > 1e-9 { (r / dist).clamp(0.0, 1.0) } else { 0.0 };
         let resid2: Vec<f64> = (0..d).map(|j| (sink_norm[j] - w0 * b0[j]).max(0.0)).collect();
