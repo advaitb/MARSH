@@ -56,9 +56,9 @@ solved as a linear program. Uncertainty comes from a parallel multinomial bootst
 
 ## Benchmarks & paper experiments
 
-The cross-method benchmark (vs. FEAST, SourceID-NMF, FastST) and all paper experiments — simulated
-sweeps and real 16S data (GlobalPatterns), with reproduction scripts and results — live on the
-[`benchmarking`](../../tree/benchmarking) branch under `benchmark/` (see `benchmark/README.md`).
+Benchmarking and manuscript-production materials are maintained separately from this public
+software repository. This repository contains the MARSH implementation and its build and usage
+documentation.
 
 ## License
 
